@@ -568,6 +568,8 @@ ov::Tensor get_random_tensor(const std::pair<std::string, benchmark_app::InputIn
         return create_tensor_random<int32_t, int32_t>(inputInfo.second);
     } else if (type == ov::element::i64) {
         return create_tensor_random<int64_t, int64_t>(inputInfo.second);
+    } else if ((type == ov::element::i4) || (type == ov::element::u4)) {
+        return ov::Tensor(inputInfo.second.type, inputInfo.second.dataShape);
     } else if ((type == ov::element::u8) || (type == ov::element::boolean)) {
         // uniform_int_distribution<uint8_t> is not allowed in the C++17
         // standard and vs2017/19
