@@ -278,6 +278,7 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         // Do it just once if that's a function
         if (real_id == id) {
             remove_long_output_names(m_compiled_submodels[real_id].model);
+            fill_empty_tensor_names(m_compiled_submodels[real_id].model);
         }
 
         if (ov::npuw::util::is_set(id, dump_sub_opt)) {
@@ -389,6 +390,32 @@ void ov::npuw::CompiledModel::remove_long_output_names(const std::shared_ptr<ov:
             LOG_INFO("Removed output tensor names for " << model->get_friendly_name());
             LOG_BLOCK();
         }
+    }
+}
+
+void ov::npuw::CompiledModel::fill_empty_tensor_names(const std::shared_ptr<ov::Model>& model) {
+    NPUW_ASSERT(model.get() != nullptr);
+
+    size_t in_tensor_idx = 0;
+    size_t out_tensor_idx = 0;
+
+    for (auto& input : model->inputs()) {
+        auto tensor_names = input.get_tensor().get_names();
+        if (tensor_names.empty()) {
+            input.get_tensor().set_names({"npuw_in_tensor_" + std::to_string(in_tensor_idx)});
+            LOG_INFO("Added input tensor name for " << model->get_friendly_name());
+            LOG_BLOCK();
+        }
+        in_tensor_idx++;
+    }
+    for (auto& output : model->outputs()) {
+        auto tensor_names = output.get_tensor().get_names();
+        if (tensor_names.empty()) {
+            output.get_tensor().set_names({"npuw_out_tensor_" + std::to_string(out_tensor_idx)});
+            LOG_INFO("Added output tensor name for " << model->get_friendly_name());
+            LOG_BLOCK();
+        }
+        out_tensor_idx++;
     }
 }
 
