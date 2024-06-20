@@ -4,6 +4,7 @@
 #include "compiled_model.hpp"
 
 #include <iostream>
+#include <sstream>
 #include <memory>
 
 #include "accuracy/comparator.hpp"
@@ -130,6 +131,7 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     auto partitioning = getPartitioning(model, m_cfg);
     m_total_stat.gflops = partitioning.total_gflops;
     m_total_stat.ops = partitioning.total_ops;
+    std::map<std::string, std::size_t> funcalls;
     const std::vector<ov::npuw::Subgraph>& orderedSubgraphs = partitioning.subgraphs;
 
     // Prepare mapping between original inputs/outputs and compiled
@@ -198,7 +200,6 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                 }
             }  // for(results)
         };
-        // Sheer ugliness here again
         if (orderedSubgraphs[id]._funcall.empty()) {
             process_params(orderedSubgraphs[id]._parameters);
             process_results(orderedSubgraphs[id]._results);
@@ -207,10 +208,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             process_params(orderedSubgraphs[id]._parameters);
             process_results(orderedSubgraphs[id]._results);
 
+            // FIMXE: Need to check if it is still relevant:
             // (!) Problem here: when functions are folded, in the
             // KVcache-like scenarios (where every function call
             // produces its own result), its result(s) will be matched
             // with _all_ instances of the result (see pic).
+
+            // Track the number of funcalls, see below
+            funcalls[orderedSubgraphs[id]._funcall]++;
         }
     }  // for(ordered_subgraphs)
     // NOTE(dm): there's a better way to do it, like we do in G-API backends.
@@ -267,6 +272,7 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             m_compiled_submodels[id].closure = subgraph._closure;
             m_compiled_submodels[id].scales = subgraph._scales;
             m_compiled_submodels[id].zerops = subgraph._zerops;
+            m_compiled_submodels[id].is_sole_funcall = (funcalls.at(subgraph._funcall) == 1);
         }  // if(!funcall)
 
         if (!m_compiled_submodels[id].model && !m_compiled_submodels[id].replaced_by) {
@@ -300,6 +306,12 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     std::map<std::size_t, std::string> forced_sub_devices{};
     const std::string fsd_opt = m_cfg.get<::intel_npu::NPUW_SUBMODEL_DEVICE>();
     forced_sub_devices = ::intel_npu ::OptionParser<std::map<std::size_t, std::string>>::parse(fsd_opt);
+
+    m_lazy_load = m_cfg.get<::intel_npu::NPUW_LAZY_LOAD>();
+    if (m_lazy_load) {
+        LOG_INFO("Lazy loading is enabled");
+    }
+
     // Compile submodels. Some of them can be functions: track which model will be
     // used as function(s): function name -> index of the compiled subgraph
     auto compile = [&](size_t id) {
@@ -340,6 +352,15 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                            " for all devices in [",
                            dev_list_str,
                            "]");
+        }
+        if (m_lazy_load && m_compiled_submodels[real_id].is_sole_funcall) {
+            LOG_INFO("Caching the compiled model...");
+            LOG_BLOCK();
+            std::ostringstream blobstream(std::stringstream::out | std::stringstream::binary);
+            m_compiled_submodels[real_id].compiled_model->export_model(blobstream);
+            m_compiled_submodels[real_id].blob = blobstream.str();
+            m_compiled_submodels[real_id].compiled_model = {};
+            LOG_INFO("Done: " << m_compiled_submodels[real_id].blob.size() / (1024.0*1014) << " MB");
         }
 
         if (m_acc_check) {
@@ -682,6 +703,7 @@ void ov::npuw::CompiledModel::implement_properties() {
                      BIND(npuw::partitioning::plan, NPUW_PLAN),
                      BIND(npuw::partitioning::fold, NPUW_FOLD),
                      BIND(npuw::partitioning::cwai, NPUW_CWAI),
+                     BIND(npuw::partitioning::lazy, NPUW_LAZY_LOAD),
                      BIND(npuw::partitioning::funcall_for_all, NPUW_FUNCALL_FOR_ALL),
                      BIND(npuw::parallel_compilation, NPUW_PARALLEL_COMPILE),
                      BIND(npuw::partitioning::dcoff_type, NPUW_DCOFF_TYPE),

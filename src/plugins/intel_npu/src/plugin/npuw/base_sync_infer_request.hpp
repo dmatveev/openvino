@@ -45,6 +45,7 @@ public:
 
     virtual void prepare_for_infer() = 0;
     virtual bool valid_subrequest(std::size_t idx) const = 0;  // FIXME: Get rid of this!
+    virtual void preload_subrequest(std::size_t idx) = 0;
     virtual void start_subrequest(std::size_t idx) = 0;
     virtual void subscribe_subrequest(std::size_t idx, Completed cb) = 0;
     virtual void run_subrequest_for_success(std::size_t idx, bool& failover) = 0;

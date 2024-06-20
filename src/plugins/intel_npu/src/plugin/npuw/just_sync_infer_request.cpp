@@ -47,9 +47,10 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
         if (comp_model_desc.replaced_by) {
             // Pre-allocate output tesnors for this function call
             const auto real_idx = comp_model_desc.replaced_by.value();
-            auto& proto_comp_model = m_npuw_model->m_compiled_submodels[real_idx].compiled_model;
-            for (size_t out_idx = 0; out_idx < proto_comp_model->outputs().size(); out_idx++) {
-                const auto& port = proto_comp_model->outputs()[out_idx];
+            auto& proto_model = m_npuw_model->m_compiled_submodels[real_idx].model;
+            auto proto_outputs = proto_model->outputs();
+            for (size_t out_idx = 0; out_idx < proto_outputs.size(); out_idx++) {
+                const auto& port = proto_outputs[out_idx];
                 m_funcall_result[LinkFrom{i, out_idx}] =
                     ov::get_tensor_impl(ov::Tensor(port.get_element_type(), port.get_shape()));
             }
@@ -60,6 +61,14 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                 continue;
             }
         }  // if(replaced_by)
+
+        if (comp_model_desc.is_sole_funcall && m_npuw_model->m_lazy_load) {
+            // We have a sole function call (what means, CWAI/FCEW) and we have
+            // lazy loading enabled - skip it here: don't create an infer request
+            // NOTE: The interim tensors are allocated anyway!!!
+            LOG_INFO("LAZY LOAD: Don't create infer requests now");
+            continue;
+        }
 
         // Special cases are handled -- so nothing to do here
         bool recompiled = false;
@@ -91,6 +100,11 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
                 // Use real_id to accumulate information about
                 // different functions
                 const auto real_id = comp_model_desc.replaced_by.value();
+                if (m_npuw_model->m_compiled_submodels[real_id].is_sole_funcall) {
+                    // By definition, there's no pipeline - skipping
+                    LOG_INFO("Skip subgraph[" << i << "]: a sole funcall");
+                    continue;
+                }
                 if (!prevs[real_id]) {  // ..met for a first time
                     LOG_INFO("Mark subgraph[" << i << "] as a head of pipeline...");
                     m_funcall_heads.push_back(i);
@@ -164,6 +178,11 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
         m_subrequests_gio.at(sub_idx).global_results[i] = out_idx;
     }
     // }}}
+
+    // Finally, reserve space for lazy-loaded blobs
+    if (m_npuw_model->m_lazy_load) {
+        m_lazy_blobs.resize(m_num_submodels);
+    }
 }
 
 void ov::npuw::JustInferRequest::connect_subrequests() {
@@ -189,7 +208,7 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
         } else if (subm[subm_idx_from].replaced_by && !subm[subm_idx_to].replaced_by) {
             // A function call to normal subgraph connection:
             // - Take a tensor from the storage & assign it to the reader
-            const auto& iport = m_subrequests[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
+            const auto iport = m_subrequests[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
             const auto& tensor = m_funcall_result.at(LinkFrom{subm_idx_from, port_idx_from});
             subreqs[subm_idx_to]->set_tensor(iport, tensor);
             LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to internal tensor");
@@ -220,8 +239,8 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             NPUW_ASSERT(subreqs[subm_idx_to]);              // cons request is created
 
             // Just set one's output tensor to another's input
-            const auto& iport = subreqs[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
-            const auto& oport = subreqs[subm_idx_from]->get_compiled_model()->outputs()[port_idx_from];
+            const auto iport = subreqs[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
+            const auto oport = subreqs[subm_idx_from]->get_compiled_model()->outputs()[port_idx_from];
             const auto& tensor = subreqs[subm_idx_from]->get_tensor(oport);
             LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to Subgraph[" << subm_idx_from << "]/"
                                       << oport);
@@ -263,7 +282,9 @@ void ov::npuw::JustInferRequest::prepare_for_infer() {
     LOG_BLOCK();
 
     // Submit global parameters (if needed) for the first subgraph
-    bind_global_parameters(next(0));
+    const auto start_id = next(0);
+    preload_subrequest(start_id);
+    bind_global_parameters(start_id);
 
     // If funcall pipelining is enabled, prefill the function "heads"
     // with constant arguments. The list of heads is empty otherwise.
@@ -287,6 +308,31 @@ bool ov::npuw::JustInferRequest::valid_subrequest(std::size_t idx) const {
 
 void ov::npuw::JustInferRequest::start_subrequest(std::size_t idx) {
     m_subrequests[idx]->start_async();
+}
+
+void ov::npuw::JustInferRequest::preload_subrequest(std::size_t idx) {
+    if (idx >= m_num_submodels || !m_npuw_model->m_lazy_load) {
+        // Nothing to do here.
+        return;
+    }
+
+    auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+    if (!comp_model_desc.is_sole_funcall) {
+        // Nothing to do here again
+        return;
+    }
+
+    LOG_DEBUG("Preloading subrequest[" << idx << "]...");
+    LOG_BLOCK();
+
+    std::istringstream iss(comp_model_desc.blob, std::stringstream::in | std::stringstream::binary);
+    m_lazy_blobs[idx] = m_npuw_model->get_npuw_plugin()->get_core()->import_model(iss, *comp_model_desc.device_it);
+    // TODO: this load should probably be hanled by the failover procedure too
+
+    m_subrequests[idx] = m_lazy_blobs[idx]->create_infer_request();
+    m_subrequest_devices[idx] = *comp_model_desc.device_it;
+
+    LOG_DEBUG("Done (" << m_subrequest_devices[idx] << ")");
 }
 
 void ov::npuw::JustInferRequest::bind_global_parameters(std::size_t idx) {
@@ -324,22 +370,17 @@ void ov::npuw::JustInferRequest::bind_global_parameters(std::size_t idx) {
     for (auto&& it : iodesc.global_params) {
         std::size_t param_idx{}, sub_in_idx{};
         std::tie(param_idx, sub_in_idx) = it;
-        LOG_DEBUG("Processing " << param_idx << " -> " << sub_in_idx << std::endl);
-        const auto& g_port = m_npuw_model->inputs()[param_idx];
+        const auto g_port = m_npuw_model->inputs()[param_idx];
         const auto& g_tnsr = m_port_to_tensor.at(g_port).tensor;
-        const auto& s_port = subr->get_inputs()[sub_in_idx];
-        LOG_DEBUG("Processing " << g_port << " -> " << s_port << "...");
+        const auto s_port = subr->get_inputs()[sub_in_idx];
         LOG_BLOCK();
         if (do_copy) {
-            LOG_DEBUG("Will be copied");
             copy_list.emplace_back(g_tnsr, s_port);
         } else {
-            LOG_DEBUG("Will be set");
             subr->set_tensor(s_port, g_tnsr);
         }
     }
 
-    LOG_DEBUG("Running copy...");
     ov::parallel_for(copy_list.size(), [&](std::size_t idx) {
         auto& it = copy_list[idx];
         ov::SoPtr<ov::ITensor> dst = subr->get_tensor(it.second);
@@ -367,8 +408,8 @@ void ov::npuw::JustInferRequest::bind_global_results(std::size_t idx) {
     for (auto&& it : iodesc.global_results) {
         std::size_t result_idx{}, sub_out_idx{};
         std::tie(result_idx, sub_out_idx) = it;
-        const auto& g_port = m_npuw_model->outputs()[result_idx];
-        const auto& s_port = m_subrequests[idx]->get_outputs()[sub_out_idx];
+        const auto g_port = m_npuw_model->outputs()[result_idx];
+        const auto s_port = m_subrequests[idx]->get_outputs()[sub_out_idx];
         m_subrequests[idx]->set_tensor(s_port, m_port_to_tensor.at(g_port).tensor);
     }
 
@@ -384,6 +425,9 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     NPUW_ASSERT(comp_model_desc.replaced_by);
     const auto real_idx = comp_model_desc.replaced_by.value();
     auto& func_desc = m_npuw_model->m_compiled_submodels[real_idx];
+    auto compiled_body = (func_desc.is_sole_funcall && m_npuw_model->m_lazy_load)
+        ? m_lazy_blobs[idx]
+        : func_desc.compiled_model;
 
     // Function call prologue:
     // 1. Walk through function dependencies and set the respective tensors
@@ -391,7 +435,7 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     for (size_t i = 0; i < func_desc.param_base; i++) {
         LOG_DEBUG("Binding parameter[" << i << "]...");
         LOG_BLOCK();
-        const auto& iport = func_desc.compiled_model->inputs()[i];
+        const auto iport = compiled_body->inputs()[i];
 
         auto link_iter = m_npuw_model->m_submodels_input_to_prev_output.find({idx, i});
         if (link_iter != m_npuw_model->m_submodels_input_to_prev_output.end()) {
@@ -425,9 +469,9 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     // the Result tensors for the entire network.
     // ..Since the tensors allocated for outputs of the networks ARE taken from the
     // "funcall_results" if those are produced by funcall results.
-    for (std::size_t i = 0; i < func_desc.compiled_model->outputs().size(); i++) {
+    for (std::size_t i = 0; i < compiled_body->outputs().size(); i++) {
         LOG_DEBUG("Binding result[" << i << "]...");
-        auto& oport = func_desc.compiled_model->outputs()[i];
+        auto oport = compiled_body->outputs()[i];
         m_subrequests[real_idx]->set_tensor(oport, m_funcall_result.at({idx, i}));
     }
     LOG_DEBUG("Done");
@@ -439,6 +483,9 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
     NPUW_ASSERT(comp_model_desc.replaced_by);
     const auto real_idx = comp_model_desc.replaced_by.value();
     auto& func_desc = m_npuw_model->m_compiled_submodels[real_idx];
+    auto compiled_body = (func_desc.is_sole_funcall && m_npuw_model->m_lazy_load)
+        ? m_lazy_blobs[idx]
+        : func_desc.compiled_model;
 
     // Bind extra parameters from the function's closure
     // First, do easy things & delay heavy stuff
@@ -447,7 +494,7 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
         auto& closure = comp_model_desc.closure[cidx];
 
         const auto closure_param_id = comp_model_desc.param_base + cidx;
-        auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
+        auto iport = compiled_body->inputs()[closure_param_id];
         auto clparam = request->get_tensor(iport);
         if (closure.get_element_type() != clparam->get_element_type()) {
             // Remember where the unpack is required
@@ -471,7 +518,7 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
         auto& closure = comp_model_desc.closure[cidx];
 
         const auto closure_param_id = comp_model_desc.param_base + cidx;
-        auto& iport = func_desc.compiled_model->inputs()[closure_param_id];
+        auto iport = compiled_body->inputs()[closure_param_id];
         auto clparam = request->get_tensor(iport);
 
         if (!comp_model_desc.scales.empty() && comp_model_desc.scales[cidx] && comp_model_desc.zerops[cidx]) {
@@ -670,7 +717,19 @@ void ov::npuw::JustInferRequest::subscribe_subrequest(std::size_t idx, Completed
 }
 
 void ov::npuw::JustInferRequest::complete_subrequest(std::size_t idx) {
-    // do nothing here
+    if (!m_npuw_model->m_lazy_load) {
+        // Nothing to do here.
+        return;
+    }
+
+    auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+    if (!comp_model_desc.is_sole_funcall) {
+        // Nothing to do here again
+        return;
+    }
+
+    m_subrequests[idx] = {};
+    m_lazy_blobs[idx] = {};
 }
 
 void ov::npuw::JustInferRequest::cancel_subrequest(std::size_t idx) {

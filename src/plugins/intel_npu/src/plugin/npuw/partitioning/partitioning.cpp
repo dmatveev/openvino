@@ -1644,9 +1644,6 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
         } else if (cfg.get<::intel_npu::NPUW_CWAI>()) {
             // Less brutal version - just transform repeated blocks
             // into the closure forms, but don't do folding.
-            // This path is likely to be removed soon (is here for
-            // debug purposes only, but doesn't have much practical
-            // sense).
             auto all_functions = p.initFunctionPipeline(Partitioner::FunctionPipelineType::CWAI);
             for (auto&& func_group : all_functions) {
                 LOG_INFO("CWAI: Process function " << func_group << "...");

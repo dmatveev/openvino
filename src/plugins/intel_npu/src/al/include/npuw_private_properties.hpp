@@ -108,6 +108,14 @@ static constexpr ov::Property<bool> cwai{"NPUW_CWAI"};
 
 /**
  * @brief
+ * Type: bool.
+ * Lazy-load precompiled partitions on the device.
+ * Default value: false.
+ */
+static constexpr ov::Property<bool> lazy{"NPUW_LAZY_LOAD"};
+
+/**
+ * @brief
  * Type: std::string.
  * Promotional data type for weights decompression. Works only with function "NPUW_FOLD"ing.
  * Possible values: "i8", "f16"

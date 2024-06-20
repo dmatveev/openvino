@@ -30,6 +30,7 @@ private:
     // implement IBaseInferRequest
     void prepare_for_infer() override;
     bool valid_subrequest(std::size_t idx) const override;
+    void preload_subrequest(std::size_t idx) override;
     void start_subrequest(std::size_t idx) override;
     void run_subrequest_for_success(std::size_t idx, bool& failover) override;
     void subscribe_subrequest(std::size_t idx, Completed cb) override;
@@ -90,6 +91,12 @@ private:
         map_t global_results;  // result idx -> output idx
     };
     std::vector<GlobalIO> m_subrequests_gio;
+
+    // A vector of pre-compiled "lazy" blobs which are loaded
+    // on device. This vector should be sparse with no more
+    // than 2-3 blobs loaded at the time (give our linear
+    // execution model). Used only with lazy_load
+    std::vector<ov::SoPtr<ov::ICompiledModel> > m_lazy_blobs;
 };
 
 }  // namespace npuw

@@ -96,7 +96,6 @@ private:
         m_submodels_input_to_prev_output;
 
     DeviceProperties m_meta_devices;
-
     DevList m_dev_list;
 
     struct execution_stats {
@@ -109,6 +108,9 @@ private:
         std::set<std::string> devices_to_avoid;
         std::shared_ptr<ov::Model> model;
         ov::SoPtr<ov::ICompiledModel> compiled_model;
+
+        bool is_sole_funcall = false; // FCEW or CWAI case (no FOLD)
+        std::string blob;
 
         std::optional<std::size_t> replaced_by;
 
@@ -130,6 +132,8 @@ private:
 
     std::function<bool(const ov::SoPtr<ov::ITensor>&, const ov::SoPtr<ov::ITensor>&)> m_acc_check;
     std::string m_ref_device;
+
+    bool m_lazy_load = false;
 
     execution_stats m_total_stat;
 };

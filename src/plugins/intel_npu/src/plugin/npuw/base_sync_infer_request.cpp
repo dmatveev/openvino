@@ -184,6 +184,7 @@ void ov::npuw::IBaseInferRequest::infer() {
     bool failover_happened = false;
     for (std::size_t idx = 0u; idx < m_num_submodels; idx++) {
         m_now_idx = idx;
+        preload_subrequest(idx + 1);
         if (!valid_subrequest(idx)) {
             continue;
         }
