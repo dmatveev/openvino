@@ -108,9 +108,19 @@ protected:
     // if we go over-designing the things.
     std::string iter_path_suffix(std::size_t idx) const;
     mutable std::optional<bool> m_iter_suffix_required;
-    std::size_t m_run_iter = 0;
+    std::size_t m_run_iter = 0u;
+
+    bool needs_copy(std::size_t idx) const;
+    std::size_t next(std::size_t idx_base) const;
+    std::size_t real(std::size_t idx) const;
 
     RqPtrs m_ref_subrequests;
+
+    using now_t = std::optional<std::size_t>;
+    now_t now_idx() const;
+
+private:
+    now_t m_now_idx;
 };
 
 }  // namespace npuw

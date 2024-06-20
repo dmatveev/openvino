@@ -26,6 +26,7 @@ public:
     std::vector<ov::ProfilingInfo> get_profiling_info() const override;
 
 private:
+    ////////////////////////////////////
     // implement IBaseInferRequest
     void prepare_for_infer() override;
     bool valid_subrequest(std::size_t idx) const override;
@@ -39,16 +40,21 @@ private:
 
     void update_subrequest_links(std::size_t idx) override;
 
+    ////////////////////////////////////
+    // now own API
+
     // FIXME: probably this one should go to the base class too
     RqPtr get_real_subrequest(std::size_t idx);
 
     void bind_global_parameters(std::size_t idx);
     void bind_global_results(std::size_t idx);
+
     void function_prologue(std::size_t idx);
     void unpack_closure(std::size_t idx, RqPtr request);
 
-    void connect_subrequests();
+    void unsafe_run_this_prep_next(std::size_t idx, bool& next_prepared_p);
 
+    void connect_subrequests();
     void recreate_subrequests(std::size_t idx);
 
     using LinkFrom = std::pair<std::size_t /* Subrequest index */
@@ -79,8 +85,9 @@ private:
     // access the model's top-level (global, public, etc) parameters
     // and results
     struct GlobalIO {
-        std::map<std::size_t, std::size_t> global_params;   // param idx -> input idx
-        std::map<std::size_t, std::size_t> global_results;  // result idx -> output idx
+        using map_t = std::map<std::size_t, std::size_t>;
+        map_t global_params;   // param idx -> input idx
+        map_t global_results;  // result idx -> output idx
     };
     std::vector<GlobalIO> m_subrequests_gio;
 };
