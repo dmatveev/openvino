@@ -325,11 +325,11 @@ void ov::npuw::JustInferRequest::preload_subrequest(std::size_t idx) {
     LOG_DEBUG("Preloading subrequest[" << idx << "]...");
     LOG_BLOCK();
 
-    std::istringstream iss(comp_model_desc.blob, std::stringstream::in | std::stringstream::binary);
-    m_lazy_blobs[idx] = m_npuw_model->get_npuw_plugin()->get_core()->import_model(iss, *comp_model_desc.device_it);
-    // TODO: this load should probably be hanled by the failover procedure too
+    // std::istringstream iss(comp_model_desc.blob, std::stringstream::in | std::stringstream::binary);
+    // m_lazy_blobs[idx] = m_npuw_model->get_npuw_plugin()->get_core()->import_model(iss, *comp_model_desc.device_it);
+    // // TODO: this load should probably be hanled by the failover procedure too
 
-    m_subrequests[idx] = m_lazy_blobs[idx]->create_infer_request();
+    m_subrequests[idx] = m_npuw_model->m_compiled_submodels[idx].compiled_model->create_infer_request();
     m_subrequest_devices[idx] = *comp_model_desc.device_it;
 
     LOG_DEBUG("Done (" << m_subrequest_devices[idx] << ")");
@@ -425,9 +425,10 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     NPUW_ASSERT(comp_model_desc.replaced_by);
     const auto real_idx = comp_model_desc.replaced_by.value();
     auto& func_desc = m_npuw_model->m_compiled_submodels[real_idx];
-    auto compiled_body = (func_desc.is_sole_funcall && m_npuw_model->m_lazy_load)
-        ? m_lazy_blobs[idx]
-        : func_desc.compiled_model;
+    auto compiled_body = // (func_desc.is_sole_funcall && m_npuw_model->m_lazy_load)
+        // ? m_lazy_blobs[idx]
+        // :
+        func_desc.compiled_model;
 
     // Function call prologue:
     // 1. Walk through function dependencies and set the respective tensors
@@ -483,9 +484,10 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
     NPUW_ASSERT(comp_model_desc.replaced_by);
     const auto real_idx = comp_model_desc.replaced_by.value();
     auto& func_desc = m_npuw_model->m_compiled_submodels[real_idx];
-    auto compiled_body = (func_desc.is_sole_funcall && m_npuw_model->m_lazy_load)
-        ? m_lazy_blobs[idx]
-        : func_desc.compiled_model;
+    auto compiled_body = // (func_desc.is_sole_funcall && m_npuw_model->m_lazy_load)
+        // ? m_lazy_blobs[idx]
+        // :
+        func_desc.compiled_model;
 
     // Bind extra parameters from the function's closure
     // First, do easy things & delay heavy stuff
@@ -729,7 +731,7 @@ void ov::npuw::JustInferRequest::complete_subrequest(std::size_t idx) {
     }
 
     m_subrequests[idx] = {};
-    m_lazy_blobs[idx] = {};
+    // m_lazy_blobs[idx] = {};
 }
 
 void ov::npuw::JustInferRequest::cancel_subrequest(std::size_t idx) {

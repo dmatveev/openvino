@@ -354,13 +354,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                            "]");
         }
         if (m_lazy_load && m_compiled_submodels[real_id].is_sole_funcall) {
-            LOG_INFO("Caching the compiled model...");
-            LOG_BLOCK();
-            std::ostringstream blobstream(std::stringstream::out | std::stringstream::binary);
-            m_compiled_submodels[real_id].compiled_model->export_model(blobstream);
-            m_compiled_submodels[real_id].blob = blobstream.str();
-            m_compiled_submodels[real_id].compiled_model = {};
-            LOG_INFO("Done: " << m_compiled_submodels[real_id].blob.size() / (1024.0*1014) << " MB");
+            // LOG_INFO("Caching the compiled model...");
+            // LOG_BLOCK();
+            // std::ostringstream blobstream(std::stringstream::out | std::stringstream::binary);
+            // m_compiled_submodels[real_id].compiled_model->export_model(blobstream);
+            // m_compiled_submodels[real_id].blob = blobstream.str();
+            // m_compiled_submodels[real_id].compiled_model = {};
+            // LOG_INFO("Done: " << m_compiled_submodels[real_id].blob.size() / (1024.0*1014) << " MB");
+            LOG_INFO("The model will be lazy");
         }
 
         if (m_acc_check) {
