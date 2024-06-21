@@ -342,6 +342,13 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                            "]");
         }
 
+        {
+            const auto blob_oname = "block" + ov::npuw::util::fmt(id, 100) + ".blob";
+            std::ofstream ofs(blob_oname, std::ios::binary);
+            m_compiled_submodels[real_id].compiled_model->export_model(ofs);
+            LOG_INFO("Exported " << blob_oname);
+        }
+
         if (m_acc_check) {
             if (submodel_device(real_id) != m_ref_device) {
                 LOG_INFO("Compile Subgraph[" << real_id << "] for reference device: " << m_ref_device << ".");
