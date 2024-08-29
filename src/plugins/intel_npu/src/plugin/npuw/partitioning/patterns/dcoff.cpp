@@ -362,6 +362,17 @@ bool DCOFFPassBase::matcher_callback(ov::pass::pattern::Matcher& m) {
         LOG_DEBUG("Matched: " << matched_paramA << ", set element type to " << m_dcoff_type);
         matched_paramA->set_element_type(m_dcoff_type);
 
+        auto matched_MM = get_root_matmul(m); // Get the pattern's root reader, the MatMul. Behavior may be pattern-dependant (what's root?)
+        const bool need_transpose = transpose_required(matched_mm); // Check if the MatMul (connected to the root) requires W transpose
+        if (m_enable_transpose && need_transpose) {
+            // assume the param's transpose_requried is a set
+            m_params_to.get().transpose_requried.insert(matched_paramA); // Let ClosureRemap know the A-tensor to be transposed
+            m_params_to.get().transpose_requried.insert(matched_paramC); // Let ClosureRemap know the S-tensor to be transposed
+            transpose_W_param(matched_paramA); // Change the dimensions of the W Parameter
+            transpose_S_param(matched_paramC); // Change the dimensions of the S Parameter
+            transpose_MM(matched_MM); // Set the MatMul's transpose_b argument to true
+        }
+
         if (m_dcoff_mode == DCOffMode::CAST_SCALE) {
             NPUW_ASSERT(m_dcoff_type == ov::element::f16);
 
@@ -396,6 +407,7 @@ bool DCOFFPassBase::matcher_callback(ov::pass::pattern::Matcher& m) {
             LOG_DEBUG("Reconnecting the root...");
             reconnect_root(m);
         }
+
         LOG_DEBUG("Done");
     }
     return false;  // root node hasn't changed
