@@ -389,6 +389,9 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
         }
     }
 
+    // Finalize memory in closures and weight banks
+    finalize_weights_bank();
+
     // Print stats report when possible
     {
         LOG_INFO("Initial device distribution:");
@@ -411,7 +414,8 @@ void ov::npuw::CompiledModel::fill_weights_bank(const std::size_t idx) {
     auto& comp_model_desc = m_compiled_submodels[idx];
 
     for (std::size_t cidx = 0u; cidx < comp_model_desc.closure.size(); cidx++) {
-        comp_model_desc.closure[cidx] = m_weights_bank->update(comp_model_desc.closure[cidx]);
+        // Register a closure tensor in the weights bank
+        m_weights_bank->update(comp_model_desc.closure[cidx]);
         if (m_cfg.get<::intel_npu::NPUW_FOLD>()) {
             comp_model_desc.update_required[cidx] = true;
         } else {
@@ -420,6 +424,21 @@ void ov::npuw::CompiledModel::fill_weights_bank(const std::size_t idx) {
     }
 
     LOG_VERB("DONE");
+}
+
+void ov::npuw::CompiledModel::finalize_weights_bank() {
+    for (std::size_t idx = 0u; idx < m_compiled_submodels.size(); idx++) {
+        auto &comp_model_desc = m_compiled_submodels[idx];
+        if (!comp_model_desc.replaced_by) {
+            continue;
+        }
+        const auto real_idx = comp_model_desc.replaced_by.value();
+        auto& func_desc = m_compiled_submodels[real_idx];
+
+        for (std::size_t cidx = 0u; cidx < comp_model_desc.closure.size(); cidx++) {
+            comp_model_desc.closure[cidx] = m_weights_bank->get(comp_model_desc.closure[cidx], *func_desc.device_it);
+        }
+    }
 }
 
 void ov::npuw::CompiledModel::remove_long_output_names(const std::shared_ptr<ov::Model>& model) {
