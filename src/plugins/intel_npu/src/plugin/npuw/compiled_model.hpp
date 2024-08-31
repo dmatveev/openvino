@@ -73,6 +73,7 @@ private:
     void implement_properties();
 
     void fill_weights_bank(const std::size_t idx);
+    void finalize_weights_bank();
 
     std::shared_ptr<::intel_npu::OptionsDesc> m_options_desc;
     ::intel_npu::Config m_cfg;
