@@ -285,6 +285,7 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
             m_compiled_submodels[id].scales = subgraph._scales;
             m_compiled_submodels[id].zerops = subgraph._zerops;
             m_compiled_submodels[id].update_required.resize(subgraph._closure.size(), false);
+            m_compiled_submodels[id].is_remote.resize(subgraph._closure.size(), false);
             fill_weights_bank(id);
         }  // if(!funcall)
 
@@ -436,7 +437,14 @@ void ov::npuw::CompiledModel::finalize_weights_bank() {
         auto& func_desc = m_compiled_submodels[real_idx];
 
         for (std::size_t cidx = 0u; cidx < comp_model_desc.closure.size(); cidx++) {
-            comp_model_desc.closure[cidx] = m_weights_bank->get(comp_model_desc.closure[cidx], *func_desc.device_it);
+            auto bank_tensor = m_weights_bank->get(comp_model_desc.closure[cidx], *func_desc.device_it);
+            if (comp_model_desc.closure[cidx].data() != bank_tensor.data()) {
+                // If the bank returned a new object for this tensor, assume it is remote
+                // A bad contract but should work for the purpose
+                comp_model_desc.closure[cidx] = std::move(bank_tensor);
+                comp_model_desc.is_remote[cidx] = true;
+                std::cout << "Assigned DEV tensor" << std::endl;
+            } else std::cout << "Keep HOST tensor" << std::endl;
         }
     }
 }

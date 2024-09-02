@@ -194,7 +194,7 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
 
             // No update required to this tensor in runtime - so it can be set only once
             if (!comp_model_desc.update_required[cidx]) {
-                request->set_tensor(iport, ov::get_tensor_impl(wbank->get(closure, *func_desc.device_it)));
+                request->set_tensor(iport, ov::get_tensor_impl(comp_model_desc.closure[cidx]));
             }
         }  // for(closure)
         LOG_VERB("DONE");
@@ -479,6 +479,7 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
     // First, do easy things & delay heavy stuff
     std::vector<std::size_t> closure_unpack_required;
     std::vector<std::size_t> closure_copy_required;
+    std::vector<std::size_t> closure_set_required;
 
     for (std::size_t cidx = 0u; cidx < comp_model_desc.closure.size(); cidx++) {
         auto& closure = comp_model_desc.closure[cidx];
@@ -490,11 +491,9 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
             // Remember where the unpack is required
             closure_unpack_required.push_back(cidx);
         } else if (comp_model_desc.update_required[cidx]) {
-            if (needs_copy(idx)) {
-                // Remember where copy is requried
+            if (needs_copy(idx, cidx)) {
                 closure_copy_required.push_back(cidx);
             } else {
-                // Easy case, just set one to another
                 request->set_tensor(iport, ov::get_tensor_impl(closure));
             }
         }
@@ -509,7 +508,7 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
         auto clparam = request->get_tensor(iport);
         ov::get_tensor_impl(closure)->copy_to(clparam._ptr);
     });
-    // }); // ms_to_run
+    // }); // ms_to_run  
 
     for (std::size_t j = 0; j != closure_unpack_required.size(); j++) {
         // NB: No need to protect anything here as containers are all

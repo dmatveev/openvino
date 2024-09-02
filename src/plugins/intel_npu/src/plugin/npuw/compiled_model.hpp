@@ -124,6 +124,7 @@ private:
         std::vector<ov::Tensor> scales;
         std::vector<ov::Tensor> zerops;
         std::vector<bool> update_required;
+        std::vector<bool> is_remote;
 
         // FIXME: Take it out of structure
         ov::SoPtr<ov::ICompiledModel> ref_compiled_model;

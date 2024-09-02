@@ -291,8 +291,23 @@ bool ov::npuw::IBaseInferRequest::needs_copy(std::size_t idx) const {
     if (ov::npuw::util::starts_with(m_subrequest_devices[real_idx], "CPU")) {
         return false;
     }
-
     // Assume all others prefer copy unless remote tensors are supported
+    return true;
+}
+
+
+bool ov::npuw::IBaseInferRequest::needs_copy(std::size_t idx, std::size_t cidx) const {
+    // +closure version. First check the base prerequisite
+    if (!needs_copy(idx)) {
+        return false;
+    }
+    auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+    if (comp_model_desc.is_remote[cidx]) {
+        // FIXME: Test if the tensor device and the request device are
+        // the same or compatible!
+        return false;
+    }
+    // Otherwise...
     return true;
 }
 
