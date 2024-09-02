@@ -36,6 +36,14 @@ private:
     std::mutex m_mutex;
     std::shared_ptr<const ov::ICore> m_core = nullptr;
     std::shared_ptr<ov::IRemoteContext> m_remote_ctx = nullptr;
+
+    struct {
+        std::size_t total_registered = 0u;
+        std::size_t pinned_total = 0u;
+        std::size_t pinned_dev = 0u;
+    } m_bytes;
+
+    bool decide_for_dev(const ov::Tensor &t, const std::string &device);
 };
 
 std::shared_ptr<Bank> bank(const std::string& bank_name, const std::shared_ptr<const ov::ICore>& core);
