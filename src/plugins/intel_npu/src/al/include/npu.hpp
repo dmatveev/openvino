@@ -101,6 +101,9 @@ public:
                                                     const ov::Shape& shape,
                                                     const Config& config);
 
+    // FIXME: Breaking some rules here again
+    virtual void* native_context() { return 0; }
+
 protected:
     virtual ~IDevice() = default;
 };
