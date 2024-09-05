@@ -201,3 +201,7 @@ ov::SoPtr<ov::ITensor> ZeroDevice::createHostTensor(std::shared_ptr<ov::IRemoteC
                                                     const Config& config) {
     return {std::make_shared<ZeroHostTensor>(context, _initStructs, element_type, shape, config)};
 };
+
+void* ZeroDevice::native_context() {
+    return _initStructs->getContext();
+}

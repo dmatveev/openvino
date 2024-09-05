@@ -101,4 +101,11 @@ std::shared_ptr<ov::IRemoteContext> RemoteContextImpl::get_this_shared_ptr() {
     return shared_from_this();
 }
 
+void* RemoteContextImpl::native_context() {
+    auto dev = _backends->getDevice(_config.get<DEVICE_ID>());
+    if (!dev) OPENVINO_THROW("No dev");
+    return dev->native_context();
+}
+
+
 }  // namespace intel_npu

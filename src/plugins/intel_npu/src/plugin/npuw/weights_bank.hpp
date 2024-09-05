@@ -18,9 +18,26 @@ namespace ov {
 namespace npuw {
 namespace weights {
 
+struct ZeroAllocator final {
+    std::shared_ptr<ov::IRemoteContext> m_remote_ctx = nullptr;
+
+    explicit ZeroAllocator(std::shared_ptr<ov::IRemoteContext> ctx) : m_remote_ctx(ctx) {
+    }
+
+    void* allocate(const size_t bytes, const size_t alignment);
+    void deallocate(void * handle, const size_t /*bytes*/, size_t /*alignment*/);
+
+    bool is_equal(const ZeroAllocator &other) const {
+        return m_remote_ctx == other.m_remote_ctx;
+    }
+};
+
 class Bank {
 public:
-    explicit Bank(const std::shared_ptr<const ov::ICore>& core) : m_core(core) {}
+    explicit Bank(const std::shared_ptr<const ov::ICore>& core)
+        : m_core(core)
+        , m_allocator(std::make_shared<ZeroAllocator>(m_core->get_default_context("NPU")._ptr)) {
+    }
 
     // Capture CPU version of the tensor
     ov::Tensor update(const ov::Tensor& tensor);
@@ -35,15 +52,7 @@ private:
     std::unordered_map<std::string, std::unordered_map<void*, ov::Tensor>> m_device_bank;
     std::mutex m_mutex;
     std::shared_ptr<const ov::ICore> m_core = nullptr;
-    std::shared_ptr<ov::IRemoteContext> m_remote_ctx = nullptr;
-
-    struct {
-        std::size_t total_registered = 0u;
-        std::size_t pinned_total = 0u;
-        std::size_t pinned_dev = 0u;
-    } m_bytes;
-
-    bool decide_for_dev(const ov::Tensor &t, const std::string &device);
+    std::shared_ptr<ZeroAllocator> m_allocator; // TODO: make it per-device
 };
 
 std::shared_ptr<Bank> bank(const std::string& bank_name, const std::shared_ptr<const ov::ICore>& core);

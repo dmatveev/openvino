@@ -2,10 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include "weights_bank.hpp"
+#include "ze_api.h"
 #include "logging.hpp"
 
+#include "openvino/runtime/allocator.hpp"
+#include "remote_context.hpp"
+
+#include "weights_bank.hpp"
+
+
 using ov::npuw::weights::Bank;
+
+namespace {
 
 class BankManager {
 public:
@@ -29,6 +37,36 @@ private:
     std::mutex m_mutex;
 };
 
+} // anonymous namespace
+
+void* ov::npuw::weights::ZeroAllocator::allocate(const size_t bytes, const size_t alignment) {
+    auto pRC = std::dynamic_pointer_cast<::intel_npu::RemoteContextImpl>(m_remote_ctx);
+    NPUW_ASSERT(pRC);
+
+    ze_host_mem_alloc_desc_t hostMemDesc = { ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC, nullptr, ZE_HOST_MEM_ALLOC_FLAG_BIAS_CACHED };
+    void* pHostMem = NULL;
+
+#define ALIGN_UP(v, a) (((v)+(a)-1) & (~((a)-1)))
+    std::size_t size = ALIGN_UP(bytes, alignment);
+#undef ALIGN_UP
+
+    ze_context_handle_t context = static_cast<ze_context_handle_t>(pRC->native_context());
+    auto ret = zeMemAllocHost(context, &hostMemDesc, size, alignment, &pHostMem);
+    NPUW_ASSERT(ret == ZE_RESULT_SUCCESS);
+    return pHostMem;
+}
+
+void ov::npuw::weights::ZeroAllocator::deallocate(void * handle, const size_t /*bytes*/, size_t /*alignment*/) {
+    auto pRC = std::dynamic_pointer_cast<::intel_npu::RemoteContextImpl>(m_remote_ctx);
+    NPUW_ASSERT(pRC);
+
+    ze_context_handle_t context = static_cast<ze_context_handle_t>(pRC->native_context());
+
+    if (handle) {
+        zeMemFree(context, handle);
+    }
+}
+
 ov::Tensor Bank::update(const ov::Tensor& tensor) {
     if (!tensor) {
         OPENVINO_THROW("Uninitialized tensor in weights bank allocation!");
@@ -36,7 +74,6 @@ ov::Tensor Bank::update(const ov::Tensor& tensor) {
 
     std::lock_guard<std::mutex> guard(m_mutex);
     m_bank[tensor.data()] = tensor;
-    m_bytes.total_registered += tensor.get_byte_size();
     return tensor;
 }
 
@@ -70,54 +107,15 @@ ov::Tensor Bank::get(const ov::Tensor& tensor, const std::string& device) {
     }
 
     // Allocation needed. Still device if allocate it on device or not.
-    const auto tbytes = tensor.get_byte_size();
-    m_bytes.pinned_total += tbytes;
+    // auto remote_ctx = m_core->get_default_context(device)._ptr;
+    // auto remote_tensor = remote_ctx->create_host_tensor(tensor.get_element_type(),
+    //                                                     tensor.get_shape());
+    auto allocated_tensor = ov::Tensor(tensor.get_element_type(),
+                                       tensor.get_shape(),
+                                       *m_allocator);
+    tensor.copy_to(allocated_tensor);
 
-    if (decide_for_dev(tensor, device)) {
-        m_remote_ctx = m_core->get_default_context(device)._ptr;
-        auto remote_tensor = m_remote_ctx->create_host_tensor(tensor.get_element_type(),
-                                                              tensor.get_shape());
-        auto allocated_tensor = ov::make_tensor(remote_tensor);
-        tensor.copy_to(allocated_tensor);
-
-        m_bytes.pinned_dev += tbytes;
-        return (device_bank[tensor.data()] = allocated_tensor);
-    }
-    // ..Not ok - still return a cpu tensor. Store it in the device_bank
-    // instead of the remote one to avoid duplicated alocations
-    return (device_bank[tensor.data()] = iter_cpu->second);
-}
-
-bool Bank::decide_for_dev(const ov::Tensor &t, const std::string &) {
-    // Called in context of allocation on the device.
-    // Decide if this particular tensor should map to device or not.
-
-    // Let the limit be hardcoded for now - to 1.7 GB
-    const std::size_t DEV_LIMIT = 1700 * 1024 * 1024;
-
-    NPUW_ASSERT(m_bytes.total_registered != 0);
-    const std::size_t tbytes = t.get_byte_size();
-
-    if (DEV_LIMIT >= m_bytes.total_registered) {
-        // All allocations fit the limit - so it is an easy check
-        return true;
-    }
-    if (m_bytes.pinned_dev == 0 && tbytes <= DEV_LIMIT) {
-        // First allocation - let it be
-        return true;
-    }
-
-    // Ratio is required to maintain the device tensor distribution across the network
-    const float target_ratio = static_cast<float>(DEV_LIMIT) / m_bytes.total_registered;
-    const float tobe_ratio = static_cast<float>(m_bytes.pinned_dev + tbytes) / m_bytes.pinned_total;
-
-    if (tobe_ratio <= target_ratio) {
-        // The resulting ratio is within treshold - let it be on device
-        return true;
-    } else {
-        // The resulting ratio is above threshold - keep it to CPU
-        return false;
-    }
+    return (device_bank[tensor.data()] = allocated_tensor);
 }
 
 std::shared_ptr<Bank> BankManager::getBank(const std::string& bank_name, const std::shared_ptr<const ov::ICore>& core) {

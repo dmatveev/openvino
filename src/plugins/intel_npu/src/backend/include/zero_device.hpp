@@ -58,6 +58,8 @@ public:
     ZeroDevice& operator=(const ZeroDevice&) = delete;
     ZeroDevice(const ZeroDevice&) = delete;
 
+    void* native_context();
+
 private:
     const std::shared_ptr<ZeroInitStructsHolder> _initStructs;
 

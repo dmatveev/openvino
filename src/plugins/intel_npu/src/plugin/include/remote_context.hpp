@@ -51,6 +51,8 @@ public:
      */
     ov::SoPtr<ov::ITensor> create_host_tensor(const ov::element::Type type, const ov::Shape& shape) override;
 
+    void *native_context(); // FIXME: break some rules here
+
 private:
     std::shared_ptr<ov::IRemoteContext> get_this_shared_ptr();
 
