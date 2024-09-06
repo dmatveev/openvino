@@ -81,6 +81,8 @@ protected:
     std::vector<ov::SoPtr<ov::ITensor>> m_input_tensors;
     std::vector<ov::SoPtr<ov::ITensor>> m_output_tensors;
 
+    std::unordered_set<void*> m_input_allocated;
+
     struct TensorStorage {
         ov::SoPtr<ov::ITensor> tensor;
         bool persistent = false;       // true for the parent I/O tensors
@@ -119,6 +121,8 @@ protected:
 
     using now_t = std::optional<std::size_t>;
     now_t now_idx() const;
+
+    ov::Tensor mkTensor(const ov::element::Type type, const ov::Shape &shape);
 
 private:
     now_t m_now_idx;
