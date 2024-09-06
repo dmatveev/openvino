@@ -5,6 +5,7 @@
 #include "base_sync_infer_request.hpp"
 
 #include "compiled_model.hpp"
+#include "plugin.hpp"
 #include "intel_npu/al/config/npuw.hpp"
 #include "logging.hpp"
 #include "util.hpp"
@@ -336,4 +337,9 @@ std::size_t ov::npuw::IBaseInferRequest::real(std::size_t idx) const {
 
 ov::npuw::IBaseInferRequest::now_t ov::npuw::IBaseInferRequest::now_idx() const {
     return m_now_idx;
+}
+
+ov::Tensor ov::npuw::IBaseInferRequest::mkTensor(const ov::element::Type type, const ov::Shape &shape) {
+    auto ctx = m_npuw_model->get_npuw_plugin()->get_default_context({});
+    return ov::make_tensor(ctx->create_host_tensor(type, shape));
 }

@@ -52,7 +52,7 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
             for (size_t out_idx = 0; out_idx < proto_comp_model->outputs().size(); out_idx++) {
                 const auto& port = proto_comp_model->outputs()[out_idx];
                 m_funcall_result[LinkFrom{i, out_idx}] =
-                    ov::get_tensor_impl(ov::Tensor(port.get_element_type(), port.get_shape()));
+                    ov::get_tensor_impl(mkTensor(port.get_element_type(), port.get_shape()));
             }
             if (real_idx != i) {
                 // If this function call is NOT the function body, do nothing here - the original
@@ -112,7 +112,9 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
     LOG_INFO("Preallocating input tensors...");
     for (size_t i = 0; i < m_npuw_model->inputs().size(); i++) {
         const auto& port = m_npuw_model->inputs()[i];
-        m_input_tensors.push_back(ov::get_tensor_impl(ov::Tensor(port.get_element_type(), port.get_shape())));
+        auto new_input_tensor = mkTensor(port.get_element_type(), port.get_shape());
+        m_input_tensors.push_back(ov::get_tensor_impl(new_input_tensor));
+        m_input_allocated.insert(new_input_tensor.data());
         m_port_to_tensor[port] = TensorStorage{m_input_tensors.back(), true};
     }  // for(inputs)
 
@@ -132,7 +134,7 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
         const auto& tensor =
             funcall_result_iter != m_funcall_result.end()
                 ? funcall_result_iter->second  // Function calls have their tensors allocated, so just use one
-                : ov::get_tensor_impl(ov::Tensor(port.get_element_type(), port.get_shape()));
+                : ov::get_tensor_impl(mkTensor(port.get_element_type(), port.get_shape()));
 
         m_output_tensors.push_back(tensor);
         m_port_to_tensor[port] = TensorStorage{tensor, true};
@@ -365,7 +367,7 @@ void ov::npuw::JustInferRequest::bind_global_parameters(std::size_t idx) {
         const auto& s_port = subr->get_inputs()[sub_in_idx];
         LOG_DEBUG("Processing " << g_port << " -> " << s_port << "...");
         LOG_BLOCK();
-        if (do_copy) {
+        if (do_copy || m_input_allocated.count(g_tnsr->data()) == 0) {
             LOG_DEBUG("Will be copied");
             copy_list.emplace_back(g_tnsr, s_port);
         } else {
@@ -508,7 +510,7 @@ void ov::npuw::JustInferRequest::unpack_closure(std::size_t idx, RqPtr request) 
         auto clparam = request->get_tensor(iport);
         ov::get_tensor_impl(closure)->copy_to(clparam._ptr);
     });
-    // }); // ms_to_run  
+    // }); // ms_to_run
 
     for (std::size_t j = 0; j != closure_unpack_required.size(); j++) {
         // NB: No need to protect anything here as containers are all
@@ -648,6 +650,7 @@ void ov::npuw::JustInferRequest::unsafe_run_this_prep_next(std::size_t idx, bool
     auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
     auto real_idx = comp_model_desc.replaced_by.value_or(idx);
     auto& this_subr = m_subrequests[real_idx];
+
     const std::size_t next_idx = next(idx + 1);
 
     if (comp_model_desc.replaced_by) {
