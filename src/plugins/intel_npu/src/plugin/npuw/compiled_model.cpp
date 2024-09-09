@@ -14,13 +14,13 @@
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/pass/constant_folding.hpp"
 #include "openvino/pass/manager.hpp"
+#include "openvino/pass/validate.hpp"
 #include "openvino/runtime/device_id_parser.hpp"
 #include "openvino/runtime/internal_properties.hpp"
 #include "openvino/runtime/properties.hpp"
 #include "openvino/util/common_util.hpp"
 #include "plugin.hpp"
 #include "util.hpp"
-#include "openvino/pass/validate.hpp"
 
 // required for get_properties_per_device()
 #include <intel_npu/al/config/config.hpp>
@@ -31,8 +31,6 @@
 #include "openvino/runtime/internal_properties.hpp"
 #include "openvino/runtime/properties.hpp"
 #include "transformations/convert_precision.hpp"
-
-#include "partitioning/patterns/opt.hpp"
 
 namespace {
 void split_properties(const ov::AnyMap& properties,
@@ -137,12 +135,6 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
 
     // FIXME: Find a better place to call this transformation
     ov::pass::ConvertPrecision(ov::element::bf16, ov::element::f16).run_on_model(model);
-
-    // FIXME: Will break offline partitioning, if any
-    ov::pass::GraphRewrite rewr;
-    rewr.add_matcher<ov::npuw::patterns::opt::DQMatMulCWi>();
-    rewr.run_on_model(model);
-    ov::pass::Validate().run_on_model(model);
 
     auto partitioning = getPartitioning(model, m_cfg);
     m_total_stat.gflops = partitioning.total_gflops;
@@ -833,6 +825,7 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::partitioning::plan, NPUW_PLAN),
                           BIND(npuw::partitioning::fold, NPUW_FOLD),
                           BIND(npuw::partitioning::cwai, NPUW_CWAI),
+                          BIND(npuw::partitioning::dyn_quant, NPUW_DQ),
                           BIND(npuw::partitioning::funcall_for_all, NPUW_FUNCALL_FOR_ALL),
                           BIND(npuw::partitioning::dcoff_type, NPUW_DCOFF_TYPE),
                           BIND(npuw::partitioning::dcoff_with_scale, NPUW_DCOFF_SCALE),
