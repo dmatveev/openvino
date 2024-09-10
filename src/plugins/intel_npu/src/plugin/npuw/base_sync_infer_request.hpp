@@ -14,6 +14,7 @@
 #include "openvino/runtime/iasync_infer_request.hpp"
 #include "openvino/runtime/isync_infer_request.hpp"
 #include "openvino/runtime/so_ptr.hpp"
+#include "weights_bank.hpp" // ZeroAllocator
 #include "perf.hpp"
 
 namespace ov {
@@ -122,6 +123,7 @@ protected:
     using now_t = std::optional<std::size_t>;
     now_t now_idx() const;
 
+    std::shared_ptr<ov::npuw::weights::ZeroAllocator> m_allocator;
     ov::Tensor mkTensor(const ov::element::Type type, const ov::Shape &shape);
 
 private:
