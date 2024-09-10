@@ -13,7 +13,8 @@
 ov::npuw::IBaseInferRequest::IBaseInferRequest(const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model)
     : ov::ISyncInferRequest(compiled_model),
       m_npuw_model(compiled_model),
-      m_num_submodels(m_npuw_model->m_compiled_submodels.size()) {
+      m_num_submodels(m_npuw_model->m_compiled_submodels.size()),
+      m_allocator(std::make_shared<weights::ZeroAllocator>(m_npuw_model->get_plugin()->get_default_context({})._ptr)) {
     m_subrequests.resize(m_num_submodels, {});
     m_subrequest_devices.resize(m_num_submodels, {});
     m_completion_cbs.resize(m_num_submodels, {});
@@ -340,6 +341,9 @@ ov::npuw::IBaseInferRequest::now_t ov::npuw::IBaseInferRequest::now_idx() const 
 }
 
 ov::Tensor ov::npuw::IBaseInferRequest::mkTensor(const ov::element::Type type, const ov::Shape &shape) {
-    auto ctx = m_npuw_model->get_npuw_plugin()->get_default_context({});
-    return ov::make_tensor(ctx->create_host_tensor(type, shape));
+    if (std::any_of(shape.begin(), shape.end(), [&](std::size_t dim) {
+        return dim == 0; })) {\
+        return ov::Tensor(type, shape);
+    }
+    return ov::Tensor(type, shape, *m_allocator);
 }

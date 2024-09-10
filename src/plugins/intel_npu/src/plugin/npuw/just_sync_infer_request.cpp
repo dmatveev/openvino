@@ -52,7 +52,7 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
             for (size_t out_idx = 0; out_idx < proto_comp_model->outputs().size(); out_idx++) {
                 const auto& port = proto_comp_model->outputs()[out_idx];
                 m_funcall_result[LinkFrom{i, out_idx}] =
-                    ov::get_tensor_impl(mkTensor(port.get_element_type(), shape));
+                    ov::get_tensor_impl(mkTensor(port.get_element_type(), port.get_shape()));
             }
             if (real_idx != i) {
                 // If this function call is NOT the function body, do nothing here - the original
