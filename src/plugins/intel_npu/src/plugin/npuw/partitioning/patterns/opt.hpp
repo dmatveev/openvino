@@ -41,6 +41,11 @@ public:
     explicit DQMatMulGQi(Context::Ref ctx);
 };
 
+class DQMatMulGQiP : public ov::pass::MatcherPass {
+public:
+    explicit DQMatMulGQiP(Context::Ref ctx);
+};
+
 }  // namespace opt
 }  // namespace patterns
 }  // namespace npuw
