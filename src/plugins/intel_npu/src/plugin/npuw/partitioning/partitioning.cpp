@@ -1136,6 +1136,20 @@ void Partitioner::saveTinyConstants(const std::string& func_name) {
             }
         }
     }  // for(n)
+
+    // Preserve some extra constants
+    using CPtr = std::shared_ptr<ov::op::v0::Constant>;
+    std::vector<CPtr> to_keep_extra;
+    
+    for (auto&& m : model_group) {
+        ov::pass::GraphRewrite rewr;
+        rewr.add_matcher<ov::npuw::patterns::SymmZP::HM1>(std::ref(to_keep_extra));
+        rewr.run_on_model(m);
+    }
+    for (auto&& tke : to_keep_extra) {
+        func_group.consts_to_keep.insert(tke);
+    }
+
     LOG_VERB("Done");
 }
 

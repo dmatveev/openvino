@@ -165,6 +165,15 @@ public:
     explicit CWAI3(Results scales);
 };
 
+class HM1 : public ov::pass::MatcherPass {
+public:
+    using CPtr = std::shared_ptr<ov::op::v0::Constant>;
+    using Results = std::reference_wrapper<std::vector<CPtr>>;
+
+    explicit HM1(Results to_keep);
+};
+
+
 }  // namespace SymmZP
 
 namespace AsymmZP {

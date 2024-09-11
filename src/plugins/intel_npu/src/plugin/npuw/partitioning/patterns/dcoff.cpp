@@ -894,8 +894,40 @@ CWAI3::CWAI3(CWAI3::Results scales) {
 //                    :                     >
 //                    V                     >
 //
-
 // Implementation TBD
+
+HM1::HM1(HM1::Results to_keep) {
+    auto qweight = opp::wrap_type<ov::op::v0::Constant>();
+    auto qcoeff = opp::wrap_type<ov::op::v0::Constant>();
+    auto qids = opp::wrap_type<ov::op::v0::Parameter>();
+    auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
+    auto qcvtids = opp::wrap_type<ov::op::v0::Convert>({qids});
+    auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qcvtw, qcoeff});
+    auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
+
+    auto qgather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, qcvtids, opp::any_input()});
+
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+
+        auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
+        auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
+
+        auto matched_qweight = std::static_pointer_cast<ov::op::v0::Constant>(matched_node_qweight);
+        auto matched_qcoeff = std::static_pointer_cast<ov::op::v0::Constant>(matched_node_qcoeff);
+
+        if (ov::element::i4 == matched_qweight->get_element_type() &&
+            ov::element::f16 == matched_qcoeff->get_element_type()) {
+            to_keep.get().push_back(matched_qweight);
+            to_keep.get().push_back(matched_qcoeff);
+            std::cout << matched_qweight << std::endl
+                      << matched_qcoeff << std::endl;
+        }
+        return false;  // did nothing here
+    };
+    register_matcher(std::make_shared<opp::Matcher>(qgather, "HM1"), std::move(callback));
+}
 
 }  // namespace SymmZP
 
