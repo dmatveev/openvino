@@ -8,14 +8,13 @@
 #include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/convert.hpp"
-#include "openvino/op/divide.hpp"
+#include "openvino/op/gather.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/reduce_sum.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/split.hpp"
-#include "openvino/op/squeeze.hpp"
-#include "openvino/op/unsqueeze.hpp"
+#include "openvino/op/subtract.hpp"
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/pass/pattern/op/label.hpp"  // any_input
 #include "openvino/pass/pattern/op/wrap_type.hpp"
@@ -350,6 +349,187 @@ DQMatMulGQ2i::DQMatMulGQ2i(Context::Ref ctx) {
         return false;  // did nothing here
     };
     register_matcher(std::make_shared<opp::Matcher>(qmm, "OptDQMatMulGQ2i"), std::move(callback));
+}
+
+// Identifies this pattern
+//
+// Multiply -----------------------------------> MatMul
+// Param(W) -> to(f32) -> Multiply -> Reshape ->
+// Param(S) ------------>
+
+DQParMMGQ::DQParMMGQ(Context::Ref ctx) {
+    auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
+    auto qcoeff = opp::wrap_type<ov::op::v0::Parameter>();
+    auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
+    auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qcvtw, qcoeff});
+    auto qreshp = opp::wrap_type<ov::op::v1::Reshape>({qmuls, opp::any_input()});
+    auto qmmi = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), opp::any_input()});
+    auto qcvtr = opp::optional<ov::op::v0::Convert>({qreshp->output(0)});
+    auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtr});
+
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+        auto w_param =
+            std::static_pointer_cast<ov::op::v0::Parameter>(node_to_output.at(qweight).get_node_shared_ptr());
+        auto s_param = std::static_pointer_cast<ov::op::v0::Parameter>(node_to_output.at(qcoeff).get_node_shared_ptr());
+        auto matmul = std::static_pointer_cast<ov::op::v0::MatMul>(node_to_output.at(qmm).get_node_shared_ptr());
+
+        auto qmmi_shape = node_to_output.at(qmm).get_shape();
+
+        if (qmmi_shape.size() != 3 || qmmi_shape[0] != 1 || qmmi_shape[1] != 1) {
+            // Limit token to 1-token shapes only (prefill requires its own tranformation)
+            return false;
+        }
+
+        if (!matmul->get_transpose_a() && !matmul->get_transpose_b()) {
+            ctx.get().register_parallel_matmul(node_to_output.at(qmmi), 2, Context::DQParMM{w_param, s_param, matmul});
+        } else if (!matmul->get_transpose_a() && matmul->get_transpose_b()) {
+            ctx.get().register_parallel_matmul(node_to_output.at(qmmi), 0, Context::DQParMM{w_param, s_param, matmul});
+        }
+        return false;  // no change here
+    };
+    register_matcher(std::make_shared<opp::Matcher>(qmm, "OptDQParMMGQ"), std::move(callback));
+}
+
+void mergeParallelMatMuls(const std::shared_ptr<ov::Model>& m, Context& ctx) {
+    ov::pass::GraphRewrite rewr;
+    rewr.add_matcher<ov::npuw::patterns::opt::DQParMMGQ>(std::ref(ctx));
+    rewr.run_on_model(m);
+
+    for (auto&& mul_to_mms : ctx.par_dq_mms) {
+        auto& parallel_matmuls = mul_to_mms.second;
+        if (parallel_matmuls.size() < 2) {
+            continue;
+        }
+        ov::Output<ov::Node> orig_multiply;
+        std::size_t axis_to_concat = -1;
+        std::tie(orig_multiply, axis_to_concat) = mul_to_mms.first;
+
+        if (!util::is_set(axis_to_concat, ctx.pmm_dims)) {
+            LOG_VERB("Parallel MatMuls found, but fusion over dim " << axis_to_concat << " is not enabled");
+            continue;
+        }
+
+        const auto& first_w = parallel_matmuls[0].w;
+        const auto& first_s = parallel_matmuls[0].s;
+        ov::ParameterVector old_w, old_s;
+        bool all_ok = true;
+        for (auto&& dqmm : parallel_matmuls) {
+            if (first_w->get_shape().size() != dqmm.w->get_shape().size() ||
+                first_s->get_shape().size() != dqmm.s->get_shape().size() ||
+                dqmm.w->get_shape().size() != dqmm.s->get_shape().size()) {
+                all_ok = false;
+                break;
+            }
+            for (std::size_t d = 0u; d < first_w->get_shape().size(); d++) {
+                if (d != axis_to_concat && (first_w->get_shape()[d] != dqmm.w->get_shape()[d] ||
+                                            first_s->get_shape()[d] != dqmm.s->get_shape()[d])) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            old_w.push_back(dqmm.w);
+            old_s.push_back(dqmm.s);
+        }
+        if (!all_ok) {
+            continue;
+        }
+        auto new_w = ctx.concat(std::move(old_w), axis_to_concat);
+        auto new_s = ctx.concat(std::move(old_s), axis_to_concat);
+        auto new_cvt = std::make_shared<ov::op::v0::Convert>(new_w, new_s->get_element_type());
+
+        std::shared_ptr<ov::Node> new_mul = std::make_shared<ov::op::v1::Multiply>(new_cvt, new_s);
+        if (new_s->get_element_type() == ov::element::f16) {
+            new_mul = std::make_shared<ov::op::v0::Convert>(new_mul, ov::element::f32);
+        }
+        auto new_w_shape = new_w->get_shape();
+
+        using S = std::vector<std::size_t>;
+        S new_rshp_v;
+        if (axis_to_concat == 2) {
+            new_rshp_v = S{new_w_shape[0] * new_w_shape[1], new_w_shape[2]};
+        } else if (axis_to_concat == 0) {
+            new_rshp_v = S{new_w_shape[0], new_w_shape[1] * new_w_shape[2]};
+        } else {
+            NPUW_ASSERT(false);
+        }
+        auto new_rshp_c = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{2}, new_rshp_v);
+        auto new_rshp = std::make_shared<ov::op::v1::Reshape>(new_mul, new_rshp_c, false);
+
+        // Transpose input_b if concat was done by 0th axis (meaning the original MM's input_b were also transposed)
+        auto new_mm = std::make_shared<ov::op::v0::MatMul>(orig_multiply, new_rshp, false, (axis_to_concat == 0));
+
+        // Create new slices & reconnect matmuls
+        // FIXME: use zip
+        std::size_t offset = 0u;
+        for (std::size_t i = 0u; i < parallel_matmuls.size(); i++) {
+            auto this_orig_wshape = parallel_matmuls[i].w->get_shape();
+            auto this_slice_start =
+                std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, S{0, 0, offset});
+            auto this_slice_end =
+                std::make_shared<ov::op::v0::Constant>(ov::element::i32,
+                                                       ov::Shape{3},
+                                                       S{1, 1, offset + this_orig_wshape[axis_to_concat]});
+            auto this_slice_step = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, S{1, 1, 1});
+            auto this_slice =
+                std::make_shared<ov::op::v8::Slice>(new_mm, this_slice_start, this_slice_end, this_slice_step);
+
+            // redirect the original matmul's readers to the slice
+            for (auto&& r : parallel_matmuls[i].mm->output(0).get_target_inputs()) {
+                r.replace_source_output(this_slice);
+            }
+            offset += this_orig_wshape[axis_to_concat];
+        }
+    }
+}
+
+// Identify a Gather+DQ MatMul pattern, lift Gather up
+// Note: this pattern is applied on the full model before any partitioning
+DQGather::DQGather() {
+    auto qweight = opp::wrap_type<ov::op::v0::Constant>();
+    auto qzerop = opp::wrap_type<ov::op::v0::Constant>();
+    auto qcoeff = opp::wrap_type<ov::op::v0::Constant>();
+    auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
+    auto qcvtz = opp::wrap_type<ov::op::v0::Convert>({qzerop});
+    auto qsubz = opp::wrap_type<ov::op::v1::Subtract>({qcvtw, qcvtz});
+    auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qsubz, qcoeff});
+    auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
+
+    auto pids = opp::wrap_type<ov::op::v0::Parameter>();
+    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, cvtids, opp::any_input()});
+
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+
+        // Create new gathers on W, Z, and S respectively
+        auto matched_out_w = node_to_output.at(qweight);
+        auto matched_out_z = node_to_output.at(qzerop);
+        auto matched_out_s = node_to_output.at(qcoeff);
+        auto matched_out_ids = node_to_output.at(cvtids);
+        auto matched_out_gather = node_to_output.at(gather);
+
+        // Replicate the compute part
+        auto gather_c = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{}, 0);
+        auto new_g_w = std::make_shared<ov::op::v8::Gather>(matched_out_w, matched_out_ids, gather_c);
+        auto new_g_z = std::make_shared<ov::op::v8::Gather>(matched_out_z, matched_out_ids, gather_c);
+        auto new_g_s = std::make_shared<ov::op::v8::Gather>(matched_out_s, matched_out_ids, gather_c);
+
+        auto new_cvt_w = std::make_shared<ov::op::v0::Convert>(new_g_w, ov::element::f16);
+        auto new_cvt_z = std::make_shared<ov::op::v0::Convert>(new_g_z, ov::element::f16);
+        auto new_sub = std::make_shared<ov::op::v1::Subtract>(new_cvt_w, new_cvt_z);
+        auto new_mul = std::make_shared<ov::op::v1::Multiply>(new_sub, new_g_s);
+        auto new_out = std::make_shared<ov::op::v0::Convert>(new_mul, ov::element::f32);
+
+        // Reconnect old gathre readers to the new Multiply
+        for (auto&& r : matched_out_gather.get_target_inputs()) {
+            r.replace_source_output(new_out);
+        }
+        return true; // root was changed
+    };
+    register_matcher(std::make_shared<opp::Matcher>(gather, "DQGather"), std::move(callback));
 }
 
 }  // namespace opt
