@@ -33,12 +33,30 @@ struct Context {
     std::set<PPtr> closures_to_f16;
     void to_f16(PPtr orig_param);
 
+    using O = ov::Output<ov::Node>;
+    struct DQParMM {
+        PPtr w, s;
+        NPtr mm;
+    };
+    using DQParMMs = std::vector<DQParMM>;
+    std::map<std::pair<O, std::size_t>, DQParMMs> par_dq_mms;
+    void register_parallel_matmul(O multiply, std::size_t axis, DQParMM&& mm);
+
+    std::map<PPtr, std::pair<ov::ParameterVector, std::size_t>> params_to_concat;
+    PPtr concat(ov::ParameterVector&& v, std::size_t dim);
+
+    struct DQUnpack {
+        PPtr w, z, s;
+    };
+    std::map<PPtr, DQUnpack> params_to_unpack;
+    PPtr unpack(PPtr w, PPtr z, PPtr s, ov::element::Type type);
+
     using Ref = std::reference_wrapper<Context>;
 };
 
 class DQMatMulCWu : public ov::pass::MatcherPass {
 public:
-    DQMatMulCWu();
+    DQMatMulCWu(Context::Ref ctx);
 };
 
 class DQMatMulGQi : public ov::pass::MatcherPass {
