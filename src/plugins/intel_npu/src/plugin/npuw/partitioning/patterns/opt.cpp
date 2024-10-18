@@ -114,6 +114,7 @@ Context::PPtr Context::host_gather(Context::PPtr w, Context::PPtr ids) {
 }
 
 namespace opp = ov::pass::pattern;
+namespace uat = ov::npuw::util::at;
 
 // FROM:
 //     ???(Act) ----------------------------------->
@@ -813,7 +814,7 @@ DQLiftGatherAsymCW::DQLiftGatherAsymCW() {
     auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
     auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, cvtids, opp::any_input()});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
@@ -824,7 +825,7 @@ DQLiftGatherAsymCW::DQLiftGatherAsymCW() {
         auto matched_out_w = node_to_output.at(qweight);
         auto matched_out_z = node_to_output.at(qzerop);
         auto matched_out_s = node_to_output.at(qcoeff);
-        auto matched_out_ids = node_to_output.at(cvtids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
         const auto& matched_out_gather = node_to_output.at(gather);
 
         // Replicate the compute part
@@ -858,7 +859,7 @@ DQLiftGatherSymCW::DQLiftGatherSymCW() {
     auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
     auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, cvtids, opp::any_input()});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
@@ -867,7 +868,7 @@ DQLiftGatherSymCW::DQLiftGatherSymCW() {
 
         auto matched_out_w = node_to_output.at(qweight);
         auto matched_out_s = node_to_output.at(qcoeff);
-        auto matched_out_ids = node_to_output.at(cvtids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
         const auto& matched_out_gather = node_to_output.at(gather);
 
         // Create new gathers on W and S, connect respectively
@@ -899,7 +900,7 @@ DQLiftGatherSymGQ::DQLiftGatherSymGQ() {
     auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qreshp});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
     auto gather = opp::wrap_type<ov::op::v8::Gather>({qcvtm, cvtids, opp::any_input()});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
@@ -909,7 +910,7 @@ DQLiftGatherSymGQ::DQLiftGatherSymGQ() {
         // Create new gathers on W and S respectively
         auto matched_out_w = node_to_output.at(qweight);
         auto matched_out_s = node_to_output.at(qcoeff);
-        auto matched_out_ids = node_to_output.at(cvtids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
         const auto& matched_out_gather = node_to_output.at(gather);
 
         auto matched_gather_shape = matched_out_gather.get_shape();
@@ -945,7 +946,7 @@ DQLiftGatherSymGQ::DQLiftGatherSymGQ() {
 // compile-time converts asymmetric MM to fp16, do the same thing here
 DQUnpackDictGatherCWu::DQUnpackDictGatherCWu(Context::Ref ctx) {
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
 
     auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
     auto qzerop = opp::wrap_type<ov::op::v0::Parameter>();
@@ -967,7 +968,7 @@ DQUnpackDictGatherCWu::DQUnpackDictGatherCWu(Context::Ref ctx) {
         auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
         auto matched_node_qzerop = node_to_output.at(qzerop).get_node_shared_ptr();
         auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
-        auto matched_out_ids = node_to_output.at(cvtids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
         auto matched_node_cvt = node_to_output.at(qcvtm).get_node_shared_ptr();
 
         auto matched_qweight = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qweight);
@@ -990,7 +991,7 @@ DQUnpackDictGatherCWu::DQUnpackDictGatherCWu(Context::Ref ctx) {
 // block (mainly, a head) was turned a function (e.g. with FUNCALL_FOR_ALL)
 DQUnpackDictGatherGQi::DQUnpackDictGatherGQi(Context::Ref ctx) {
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
 
     auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
     auto qcoeff = opp::wrap_type<ov::op::v0::Parameter>();
@@ -1008,7 +1009,7 @@ DQUnpackDictGatherGQi::DQUnpackDictGatherGQi(Context::Ref ctx) {
 
         auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
         auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
-        auto matched_out_ids = node_to_output.at(cvtids);
+        auto matched_out_ids = uat::_(node_to_output).at_or_at(cvtids, pids);
         auto matched_node_cvt = node_to_output.at(qcvtm).get_node_shared_ptr();
 
         auto matched_qweight = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qweight);
@@ -1033,7 +1034,7 @@ DQUnpackDictGatherGQi::DQUnpackDictGatherGQi(Context::Ref ctx) {
 // * - DictGather-related transformations
 HostGather::HostGather(Context::Ref ctx) {
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
 
     auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
     auto qgthrw = opp::wrap_type<ov::op::v8::Gather>({qweight, cvtids, opp::any_input()});
@@ -1089,7 +1090,7 @@ HostGather::HostGather(Context::Ref ctx) {
 // due to i4-to-fp16 conversion.
 HostGatherDQ::HostGatherDQ(Context::Ref ctx) {
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
-    auto cvtids = opp::wrap_type<ov::op::v0::Convert>({pids});
+    auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
 
     auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
     auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
@@ -1116,7 +1117,7 @@ HostGatherDQ::HostGatherDQ(Context::Ref ctx) {
         const auto& matched_out_qweight = node_to_output.at(qweight);
         auto qweight_type = matched_out_qweight.get_element_type();
 
-        if (out_len >= 2048 && qweight_type == ov::element::i4) {
+        if (out_len >= 2048 && qweight_type == ov::element::i4 || qweight_type == ov::element::i8) {
             auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
             auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
             auto matched_node_ids = node_to_output.at(pids).get_node_shared_ptr();
