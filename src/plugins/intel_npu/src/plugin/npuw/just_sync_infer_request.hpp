@@ -153,9 +153,6 @@ private:
 
     // Represents spatial run-time info
     runtime::spatial::Selector::Ptr m_spatial_selector;
-
-    // Cached check if we do FOLDing and need to update closures in the repeating blocks
-    bool m_closure_update_required = false;
 };
 
 }  // namespace npuw
