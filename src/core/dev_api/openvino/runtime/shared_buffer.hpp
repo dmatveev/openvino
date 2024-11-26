@@ -6,6 +6,32 @@
 
 #include "openvino/runtime/aligned_buffer.hpp"
 
+#include <iostream>
+#include <iomanip>
+#include <memory>
+
+namespace ov {
+class MappedMemory;
+struct AlignedBuffer;
+}
+namespace {
+template<class T>
+struct P {
+    static void p_alloc(const char *data, std::size_t size) {}
+    static void p_dealloc(const char *data, std::size_t size) {}
+};
+
+template<>
+struct P<std::shared_ptr<ov::MappedMemory> > {
+    static void p_alloc(const char *data, std::size_t size) {
+        std::cout << "Constructing shared buffer: data=" << static_cast<const void*>(data) << ", size=" << size << std::endl;
+    }
+    static void p_dealloc(const char *data, std::size_t size) {
+        std::cout << "Destructing shared buffer: data=" << static_cast<const void*>(data) << ", size=" << size << std::endl;
+    }
+};
+}
+
 namespace ov {
 
 /// \brief SharedBuffer class to store pointer to pre-allocated buffer. Own the shared object.
@@ -16,9 +42,11 @@ public:
         m_allocated_buffer = data;
         m_aligned_buffer = data;
         m_byte_size = size;
+        P<T>::p_alloc(data, size);
     }
 
     virtual ~SharedBuffer() {
+        P<T>::p_dealloc(m_allocated_buffer, m_byte_size);
         m_aligned_buffer = nullptr;
         m_allocated_buffer = nullptr;
         m_byte_size = 0;

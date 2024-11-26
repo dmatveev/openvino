@@ -91,8 +91,18 @@ ov::Tensor Bank::unsafe_eval_and_alloc(const LazyTensor& tensor, const std::stri
     // Note: private method used inside other methods with already locked mutex
     const auto& transformed_tensor = tensor.eval();
     if (device_for_alloc == "CPU") {
-        m_device_bank[device_for_alloc][tensor] = transformed_tensor;
-        return transformed_tensor;
+        // REVERTME:{{{
+        // Store a copy of the tensor memory even on CPU - to simulate
+        // bank load.
+
+        ov::Tensor new_tensor(transformed_tensor.get_element_type(), transformed_tensor.get_shape());
+        transformed_tensor.copy_to(new_tensor);
+        m_device_bank[device_for_alloc][tensor] = new_tensor;
+        return new_tensor;
+        // Old code here:
+        // m_device_bank[device_for_alloc][tensor] = transformed_tensor;
+        // return transformed_tensor;
+        // REVERTME:}}}
     }
 
     ov::SoPtr<ov::ITensor> remote_tensor;

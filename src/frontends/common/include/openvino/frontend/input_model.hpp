@@ -14,6 +14,8 @@
 #include "openvino/frontend/place.hpp"
 #include "openvino/frontend/visibility.hpp"
 
+#include <iostream>
+
 namespace ov {
 namespace frontend {
 class FrontEnd;
@@ -45,13 +47,17 @@ class FRONTEND_API InputModel {
 public:
     using Ptr = std::shared_ptr<InputModel>;
 
-    InputModel() = default;
+    InputModel() {
+        std::cout << "Create InputModel " << this << std::endl;
+    }
     InputModel(const InputModel&) = delete;
     InputModel(InputModel&&) = delete;
     InputModel& operator=(const InputModel&) = delete;
     InputModel& operator=(InputModel&&) = delete;
 
-    virtual ~InputModel() = default;
+    virtual ~InputModel() {
+        std::cout << "Destroy InputModel " << this << std::endl;        
+    }
 
     /////  Searching for places  /////
 
