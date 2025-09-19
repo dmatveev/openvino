@@ -12,14 +12,10 @@
 #include "online/compiler.hpp"
 #include "online/utils/utils.hpp"  // getMetaDesc
 #include "openvino/core/parallel.hpp"
-#include "openvino/op/add.hpp"
-#include "openvino/op/broadcast.hpp"
 #include "openvino/op/convert.hpp"
-#include "openvino/op/matmul.hpp"
-#include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/slice.hpp"
-#include "openvino/op/softmax.hpp"
+#include "openvino/op/broadcast.hpp"
 #include "openvino/op/util/op_types.hpp"
 #include "openvino/pass/validate.hpp"
 #include "openvino/runtime/make_tensor.hpp"
@@ -28,7 +24,6 @@
 #include "patterns/dcoff.hpp"
 #include "patterns/opt.hpp"
 #include "patterns/pre_compute.hpp"
-#include "patterns/sdpa.hpp"
 #include "traits.hpp"
 
 namespace ov {
@@ -1804,181 +1799,72 @@ void Partitioner::identifyAttentionParams(ov::npuw::Function& f) {
 
     ov::npuw::function::Attention dyn;
 
-    // First try to find ScaledDotProductAttention operator (original approach)
+    // Find the mask input (also sizeable). FIXME: We know too much at this point
     auto ops = f._model->get_ordered_ops();
     auto sdpa_iter = std::find_if(ops.begin(), ops.end(), [](auto&& node_ptr) {
         return ov::is_type<ov::op::v13::ScaledDotProductAttention>(node_ptr);
     });
+    if (sdpa_iter == ops.end()) {
+        LOG_WARN("SDPA is not found in the attn subgraph!");
+        return;  // do nothing
+    }
 
-    if (sdpa_iter != ops.end()) {
-        // Original SDPA approach - use ScaledDotProductAttention operator
-        LOG_INFO("Found ScaledDotProductAttention operator, using original approach");
+    // Traverse the SDPA's mask input upwards to find the proper Parameter.
+    // Only unary ops are allowed along the way
+    auto sdpa_node = *sdpa_iter;
+    NPUW_ASSERT(sdpa_node->inputs().size() >= 4);
 
-        auto sdpa_node = *sdpa_iter;
-        NPUW_ASSERT(sdpa_node->inputs().size() >= 4);
-
-        auto mask_in_node = sdpa_node->inputs()[3].get_source_output().get_node_shared_ptr();
-        while (mask_in_node && !ov::op::util::is_parameter(mask_in_node)) {
-            if (mask_in_node->inputs().size() != 1) {
-                LOG_WARN("Non-unary or disconnected op on the way from SDPA to input mask");
-                return;
-            }
-            mask_in_node = mask_in_node->inputs()[0].get_source_output().get_node_shared_ptr();
-        }
-        NPUW_ASSERT(ov::op::util::is_parameter(mask_in_node));
-        dyn._mask = std::static_pointer_cast<ov::op::v0::Parameter>(mask_in_node);
-        dyn._mask_shape = dyn._mask->get_shape();
-
-        // Continue with original logic...
-        const auto& f_params = f._model->get_parameters();
-        NPUW_ASSERT(f_params.size() > 0);
-
-        auto find_context_dim = [&](const auto& param, auto&& f) {
-            const auto& param_shape = param->get_shape();
-            auto past_len = dyn.context_len() - dyn.query_len();
-            auto dim_iter = std::find(param_shape.begin(), param_shape.end(), past_len);
-            if (dim_iter == param_shape.end()) {
-                return false;
-            }
-            if (std::find(dim_iter + 1, param_shape.end(), past_len) != param_shape.end()) {
-                return false;
-            }
-            f(*dim_iter);
-            return true;
-        };
-
-        for (auto&& param : f_params) {
-            if (ov::npuw::util::starts_with(param->get_friendly_name(), "past")) {
-                if (!find_context_dim(param, [&](std::size_t dim) {
-                        dyn._inputs.push_back(ov::npuw::function::Attention::Param{param, 2});
-                    })) {
-                    return;
-                }
-            }
-        }
-
-        if (dyn._inputs.empty() || !dyn._mask) {
+    auto mask_in_node = sdpa_node->inputs()[3].get_source_output().get_node_shared_ptr();
+    while (mask_in_node && !ov::op::util::is_parameter(mask_in_node)) {
+        if (mask_in_node->inputs().size() != 1) {
+            LOG_WARN("Non-unary or disconnected op on the way from SDPA to input mask");
             return;
         }
-
-        f._attention = std::move(dyn);
-        return;
+        mask_in_node = mask_in_node->inputs()[0].get_source_output().get_node_shared_ptr();
     }
+    NPUW_ASSERT(ov::op::util::is_parameter(mask_in_node));
+    dyn._mask = std::static_pointer_cast<ov::op::v0::Parameter>(mask_in_node);
+    dyn._mask_shape = dyn._mask->get_shape();
 
-    // Alternative approach: look for SDPA pattern (MatMul -> Add -> Softmax -> MatMul)
-    LOG_INFO("ScaledDotProductAttention operator not found, searching for SDPA pattern");
-
-    // Find SDPA pattern components
-    std::shared_ptr<ov::Node> matmul1_node = nullptr;
-    std::shared_ptr<ov::Node> matmul2_node = nullptr;
-    std::shared_ptr<ov::Node> softmax_node = nullptr;
-    std::shared_ptr<ov::Node> add_node = nullptr;
-
-    // Search for the pattern: MatMul -> Add -> Softmax -> MatMul
-    for (auto&& node : ops) {
-        if (ov::is_type<ov::op::v8::Softmax>(node)) {
-            softmax_node = node;
-
-            // Check if softmax is fed by Add
-            auto softmax_input = node->input(0).get_source_output().get_node_shared_ptr();
-            if (ov::is_type<ov::op::v1::Add>(softmax_input)) {
-                add_node = softmax_input;
-
-                // Check if add is fed by MatMul (first MatMul)
-                auto add_input0 = add_node->input(0).get_source_output().get_node_shared_ptr();
-                if (ov::is_type<ov::op::v0::MatMul>(add_input0)) {
-                    matmul1_node = add_input0;
-                }
-            }
-
-            // Check if softmax feeds into MatMul (second MatMul)
-            for (auto&& output : node->outputs()) {
-                for (auto&& target_input : output.get_target_inputs()) {
-                    auto target_node = target_input.get_node()->shared_from_this();
-                    if (ov::is_type<ov::op::v0::MatMul>(target_node)) {
-                        matmul2_node = target_node;
-                        break;
-                    }
-                }
-                if (matmul2_node)
-                    break;
-            }
-
-            if (matmul1_node && matmul2_node) {
-                break;  // Found complete pattern
-            }
-        }
-    }
-
-    if (!matmul1_node || !matmul2_node || !softmax_node || !add_node) {
-        return;
-    }
-
-    LOG_INFO("Found SDPA pattern: MatMul -> Add -> Softmax -> MatMul");
-
-    // Use our new attention parameter extraction function
-    auto attention_params = ov::npuw::patterns::attn::extractAttentionParamsFromSDPAPattern(matmul1_node,
-                                                                                            matmul2_node,
-                                                                                            softmax_node,
-                                                                                            add_node);
-
-    if (attention_params.batch_size <= 0 || attention_params.num_heads <= 0) {
-        LOG_WARN("Failed to extract valid attention parameters from SDPA pattern");
-        return;
-    }
-
-    LOG_DEBUG("Successfully extracted attention parameters from SDPA pattern:");
-    LOG_DEBUG("  Batch size: " << attention_params.batch_size);
-    LOG_DEBUG("  Number of heads: " << attention_params.num_heads);
-    LOG_DEBUG("  Sequence length: " << attention_params.sequence_length);
-    LOG_DEBUG("  Head dimension: " << attention_params.head_dim);
-
-    // Find mask parameter from the add node
-    if (add_node->get_input_size() > 1) {
-        auto mask_in_node = add_node->input(1).get_source_output().get_node_shared_ptr();
-        // Traverse upwards to find parameter
-        while (mask_in_node && !ov::op::util::is_parameter(mask_in_node)) {
-            if (mask_in_node->inputs().size() != 1) {
-                LOG_WARN("Non-unary or disconnected op on the way from SDPA to input mask");
-                return;
-            }
-            mask_in_node = mask_in_node->inputs()[0].get_source_output().get_node_shared_ptr();
-        }
-
-        NPUW_ASSERT(ov::op::util::is_parameter(mask_in_node));
-
-        if (mask_in_node && ov::op::util::is_parameter(mask_in_node)) {
-            dyn._mask = std::static_pointer_cast<ov::op::v0::Parameter>(mask_in_node);
-            dyn._mask_shape = dyn._mask->get_shape();
-        }
-    }
-
-    // Find input parameters that could be past key/value
+    // Find the attention inputs with dynamic range
     const auto& f_params = f._model->get_parameters();
-    for (auto&& param : f_params) {
-        const std::string param_name = param->get_friendly_name();
-        size_t sequence_dim_idx = 0;
+    NPUW_ASSERT(f_params.size() > 0);
 
-        if (ov::npuw::util::isPastKeyValuesKey(param_name)) {
-            // This is likely a key parameter, use K dimension info
-            sequence_dim_idx = attention_params.k_dims.sequence_dim;
-        } else if (ov::npuw::util::isPastKeyValuesValue(param_name)) {
-            // This is likely a value parameter, use V dimension info
-            sequence_dim_idx = attention_params.v_dims.sequence_dim;
-        } else {
-            continue;
+    auto find_context_dim = [&](const auto& param, auto &&f) {
+        const auto &param_shape = param->get_shape();
+        // Look for the dynamic parameter size - past size in this case
+        // With our approach it is context_size - query_size
+        auto past_len = dyn.context_len() - dyn.query_len();
+        auto dim_iter = std::find(param_shape.begin(), param_shape.end(), past_len);
+        if (dim_iter == param_shape.end()) {
+            // No such dim found
+            return false;
         }
+        if (std::find(dim_iter + 1, param_shape.end(), past_len) != param_shape.end()) {
+            // There must be no other such dim
+            return false;
+        }
+        f(*dim_iter);
+        return true;
+    };
 
-        dyn._inputs.push_back(ov::npuw::function::Attention::Param{param, sequence_dim_idx});
+    for (auto&& param : f_params) {
+        // A bad test but it is what it is
+        if (ov::npuw::util::starts_with(param->get_friendly_name(), "past")) {
+            if (!find_context_dim(param, [&](std::size_t dim) {
+                dyn._inputs.push_back(ov::npuw::function::Attention::Param{param, 2});
+            })) {
+                return;             // Couldn't identify parameter's dynamic dimension
+            }
+        }
     }
 
-    if (!dyn._inputs.empty() || dyn._mask) {
-        f._attention = std::move(dyn);
-        LOG_INFO("Successfully configured dynamic attention context from SDPA pattern");
-        return;
+    if (dyn._inputs.empty() || !dyn._mask) {
+        return;  // do nothing
     }
 
-    LOG_WARN("Neither ScaledDotProductAttention operator nor SDPA pattern found in the attn subgraph!");
+    // Accept the change
+    f._attention = std::move(dyn);
 }
 
 void Partitioner::createFunction(const std::string& func_name) {
@@ -2145,7 +2031,7 @@ void Partitioner::attention(const std::string& func_name) {
     // block, its shape argument is normally a precomputed Const (which would be
     // an expression/a subgraph in the original dynamic IR). Since we retrofit
     // dynamism into a static shape environment here, we need to patch it back.
-    for (auto&& op : f._model->get_ordered_ops()) {
+    for (auto &&op : f._model->get_ordered_ops()) {
         if (!ov::is_type<ov::op::v3::Broadcast>(op)) {
             continue;
         }
@@ -2158,7 +2044,7 @@ void Partitioner::attention(const std::string& func_name) {
 
         auto shape_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(shape_source);
         auto shape_values = shape_const->cast_vector<int32_t>();
-        for (auto&& d : shape_values) {
+        for (auto &&d : shape_values) {
             //  Assume the context length is the mask's innermost dimension
             if (static_cast<std::size_t>(d) == f._attention->context_len()) {
                 d = 1;
@@ -2169,58 +2055,6 @@ void Partitioner::attention(const std::string& func_name) {
                                                                 shape_values);
         op->input(1).replace_source_output(new_const);
     }
-
-    // Patch Reshape constants
-    for (auto&& op : f._model->get_ordered_ops()) {
-        if (!ov::is_type<ov::op::v1::Reshape>(op)) {
-            continue;
-        }
-
-        // Check if Reshape's single consumer is MatMul
-        auto target_inputs = op->output(0).get_target_inputs();
-        if (target_inputs.size() != 1) {
-            continue;  // Reshape should have exactly one consumer
-        }
-
-        auto matmul_node = target_inputs.begin()->get_node()->shared_from_this();
-        if (!ov::is_type<ov::op::v0::MatMul>(matmul_node)) {
-            continue;
-        }
-
-        // Check if MatMul's input 0 is from Softmax
-        auto matmul_input0 = matmul_node->input(0).get_source_output().get_node_shared_ptr();
-        if (!ov::is_type<ov::op::v8::Softmax>(matmul_input0)) {
-            continue;
-        }
-
-        LOG_INFO("Found Reshape -> MatMul pattern where MatMul input 0 is from Softmax, patching Reshape constant");
-
-        // Inspect the reshape constant (shape input)
-        auto shape_source = op->input(1).get_source_output().get_node_shared_ptr();
-        if (!ov::is_type<ov::op::v0::Constant>(shape_source)) {
-            LOG_WARN("Reshape's shape input is not Const: " << shape_source << ", skipping");
-            continue;
-        }
-
-        auto shape_const = std::dynamic_pointer_cast<ov::op::v0::Constant>(shape_source);
-        auto shape_values = shape_const->cast_vector<int32_t>();
-
-        int64_t value_seq_dim = -1;
-        for (auto parm : f._attention->_inputs) {
-            auto parm_node = parm.param;
-            if (ov::npuw::util::isPastKeyValuesValue(parm_node->get_friendly_name())) {
-                value_seq_dim = static_cast<int64_t>(parm.dim);
-            }
-        }
-        NPUW_ASSERT(value_seq_dim != -1);
-        shape_values[value_seq_dim] = -1;
-
-        auto new_const = std::make_shared<ov::op::v0::Constant>(shape_const->get_element_type(),
-                                                                shape_const->get_shape(),
-                                                                shape_values);
-        op->input(1).replace_source_output(new_const);
-    }
-
     f._model->validate_nodes_and_infer_types();
     LOG_VERB("Done");
 }
