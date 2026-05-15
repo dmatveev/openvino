@@ -1149,46 +1149,42 @@ std::shared_ptr<ov::npuw::CompiledModel> ov::npuw::CompiledModel::deserialize_or
     bool require_weights_bank,
     const std::function<std::string(const std::string&)>& decrypt) {
     ov::npuw::orc::ScopedReadSection root(stream);
-    if (root.header().type != kOrcType || root.header().version != kOrcVersion ||
+    if (root.header().type != kOrcType || root.header().version > kOrcVersion ||
         ov::npuw::orc::has_flag(root.header().flags, ov::npuw::orc::SectionFlag::LEAF)) {
         OPENVINO_THROW("Unsupported ORC NPUW root section");
     }
 
-    std::shared_ptr<ov::npuw::CompiledModel> compiled;
-    bool is_weightless = false;
-    std::string encrypted_payload;
-
     const bool encrypted = ov::npuw::orc::has_flag(root.header().flags, ov::npuw::orc::SectionFlag::ENCRYPTED);
 
-    {
-        ov::npuw::orc::ScopedReadSection meta(stream);
-        if (meta.header().type != ov::npuw::orc::META_SECTION_TYPE ||
-            !ov::npuw::orc::has_flag(meta.header().flags, ov::npuw::orc::SectionFlag::LEAF)) {
-            OPENVINO_THROW("Expected ORC NPUW metadata section, got type ", meta.header().type);
-        }
-        auto meta_stream = ov::npuw::s11n::Stream::reader(stream);
-
-        std::string model_name;
-        ov::ParameterVector parameters;
-        ov::NodeVector results;
-        meta_stream & model_name & parameters & results;
-
-        auto ov_model = std::make_shared<ov::Model>(ov::as_output_vector(results), parameters, model_name);
-        compiled = std::make_shared<ov::npuw::CompiledModel>(ov_model, plugin, true);
-        compiled->m_name = std::move(model_name);
-        meta_stream & compiled->m_inputs_to_submodels_inputs & compiled->m_outputs_to_submodels_outputs &
-            compiled->m_param_subscribers & compiled->m_submodels_input_to_prev_output;
-        meta_stream & compiled->m_dev_list;
-        meta_stream & compiled->m_cfg;
-        compiled->m_cfg.parseEnvVars();
-        meta_stream & compiled->m_non_npuw_props;
-        meta_stream & is_weightless;
-        meta_stream & compiled->m_bf16_consts;
-        if (encrypted) {
-            meta_stream & encrypted_payload;
-        }
-        meta.expect_end();
+    ov::npuw::orc::ScopedReadSection meta(stream);
+    if (meta.header().type != ov::npuw::orc::META_SECTION_TYPE ||
+        !ov::npuw::orc::has_flag(meta.header().flags, ov::npuw::orc::SectionFlag::LEAF)) {
+        OPENVINO_THROW("Expected ORC NPUW metadata section, got type ", meta.header().type);
     }
+    auto meta_stream = ov::npuw::s11n::Stream::reader(stream);
+
+    std::string model_name;
+    ov::ParameterVector parameters;
+    ov::NodeVector results;
+    meta_stream & model_name & parameters & results;
+
+    auto ov_model = std::make_shared<ov::Model>(ov::as_output_vector(results), parameters, model_name);
+    auto compiled = std::make_shared<ov::npuw::CompiledModel>(ov_model, plugin, true);
+    compiled->m_name = std::move(model_name);
+    meta_stream & compiled->m_inputs_to_submodels_inputs & compiled->m_outputs_to_submodels_outputs &
+        compiled->m_param_subscribers & compiled->m_submodels_input_to_prev_output;
+    meta_stream & compiled->m_dev_list;
+    meta_stream & compiled->m_cfg;
+    compiled->m_cfg.parseEnvVars();
+    meta_stream & compiled->m_non_npuw_props;
+    bool is_weightless = false;
+    meta_stream & is_weightless;
+    meta_stream & compiled->m_bf16_consts;
+    std::string encrypted_payload;
+    if (encrypted) {
+        meta_stream & encrypted_payload;
+    }
+    meta.expect_end();
 
     compiled->m_import_weights_ctx = make_import_weights_ctx(properties, is_weightless, compiled->m_bf16_consts);
     bool have_weights = false;
