@@ -1163,9 +1163,7 @@ std::shared_ptr<ov::npuw::CompiledModel> ov::npuw::CompiledModel::deserialize_or
 
     const bool encrypted = ov::npuw::orc::has_flag(root.header().flags, ov::npuw::orc::SectionFlag::ENCRYPTED);
 
-    // Read the model-level metadata fields.  In v0 these were written as raw
-    // s11n bytes directly into the container body; v1 wraps them in an
-    // explicit META leaf child so the section tree is fully self-describing.
+    // Read the model-level metadata fields from the META leaf child section.
     auto read_meta_fields = [&]() {
         auto meta_stream = ov::npuw::s11n::Stream::reader(stream);
 
@@ -1191,10 +1189,6 @@ std::shared_ptr<ov::npuw::CompiledModel> ov::npuw::CompiledModel::deserialize_or
     };
 
     if (root.header().version == 0) {
-        // v0: metadata written as raw s11n bytes at the start of the container body.
-        read_meta_fields();
-    } else if (root.header().version == 1) {
-        // v1: metadata wrapped in a META leaf child section.
         ov::npuw::orc::ScopedReadSection meta(stream);
         if (meta.header().type != ov::npuw::orc::META_SECTION_TYPE ||
             !ov::npuw::orc::has_flag(meta.header().flags, ov::npuw::orc::SectionFlag::LEAF)) {
