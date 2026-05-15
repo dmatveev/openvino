@@ -1149,22 +1149,23 @@ std::shared_ptr<ov::npuw::CompiledModel> ov::npuw::CompiledModel::deserialize_or
     bool require_weights_bank,
     const std::function<std::string(const std::string&)>& decrypt) {
     ov::npuw::orc::ScopedReadSection root(stream);
-    if (root.header().type != kOrcType || root.header().version > kOrcVersion ||
+    if (root.header().type != kOrcType || root.header().version != kOrcVersion ||
         ov::npuw::orc::has_flag(root.header().flags, ov::npuw::orc::SectionFlag::LEAF)) {
         OPENVINO_THROW("Unsupported ORC NPUW root section");
     }
 
-    // Variables populated during metadata read but used in the child-reading
-    // phase below.  Extracted before the version branch so both paths share
-    // the same child-consuming lambdas.
     std::shared_ptr<ov::npuw::CompiledModel> compiled;
     bool is_weightless = false;
     std::string encrypted_payload;
 
     const bool encrypted = ov::npuw::orc::has_flag(root.header().flags, ov::npuw::orc::SectionFlag::ENCRYPTED);
 
-    // Read the model-level metadata fields from the META leaf child section.
-    auto read_meta_fields = [&]() {
+    {
+        ov::npuw::orc::ScopedReadSection meta(stream);
+        if (meta.header().type != ov::npuw::orc::META_SECTION_TYPE ||
+            !ov::npuw::orc::has_flag(meta.header().flags, ov::npuw::orc::SectionFlag::LEAF)) {
+            OPENVINO_THROW("Expected ORC NPUW metadata section, got type ", meta.header().type);
+        }
         auto meta_stream = ov::npuw::s11n::Stream::reader(stream);
 
         std::string model_name;
@@ -1186,18 +1187,7 @@ std::shared_ptr<ov::npuw::CompiledModel> ov::npuw::CompiledModel::deserialize_or
         if (encrypted) {
             meta_stream & encrypted_payload;
         }
-    };
-
-    if (root.header().version == 0) {
-        ov::npuw::orc::ScopedReadSection meta(stream);
-        if (meta.header().type != ov::npuw::orc::META_SECTION_TYPE ||
-            !ov::npuw::orc::has_flag(meta.header().flags, ov::npuw::orc::SectionFlag::LEAF)) {
-            OPENVINO_THROW("Expected ORC NPUW metadata section, got type ", meta.header().type);
-        }
-        read_meta_fields();
         meta.expect_end();
-    } else {
-        OPENVINO_THROW("Unsupported ORC NPUW PartitionedModel version ", root.header().version);
     }
 
     compiled->m_import_weights_ctx = make_import_weights_ctx(properties, is_weightless, compiled->m_bf16_consts);
