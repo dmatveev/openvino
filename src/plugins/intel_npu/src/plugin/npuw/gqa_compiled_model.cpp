@@ -11,8 +11,11 @@
 #include "intel_npu/config/npuw.hpp"
 #include "logging.hpp"
 #include "npuw_transformations/collapse_unqdq.hpp"
+#include "npuw_transformations/optimize_value_tensors.hpp"
 #include "openvino/core/version.hpp"
+#include "openvino/pass/manager.hpp"
 #include "serialization.hpp"
+#include "transformations/op_conversions/group_query_attention_decomposition.hpp"
 
 namespace {
 
@@ -52,8 +55,8 @@ ov::AnyMap with_gqa_defaults(const ov::AnyMap& properties) {
         config["NPUW_ATTN"] = "STATIC";
     }
     if (config.count("NPUW_ONLINE_KEEP_BLOCK_SIZE") == 0) {
-        // GQA isolation block: 1 GQA + 1 input Transpose + 2×(Slice+Broadcast+ShapeOf) + 1 output Transpose = 9
-        config["NPUW_ONLINE_KEEP_BLOCK_SIZE"] = "9";
+        // Unrolled SDPA attention block: MatMul + Add + Softmax + MatMul
+        config["NPUW_ONLINE_KEEP_BLOCK_SIZE"] = "4";
     }
     return config;
 }
@@ -63,6 +66,11 @@ ov::AnyMap with_gqa_defaults(const ov::AnyMap& properties) {
 ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(const std::shared_ptr<ov::Model>& model,
                                                                               const ov::AnyMap& properties) {
     auto prepared_properties = with_gqa_defaults(properties);
+    ov::pass::Manager manager;
+    manager.register_pass<ov::pass::GroupQueryAttentionDecomposition>();
+    manager.run_passes(model);
+    ov::npuw::util::OptimizeValueTensors(false).run_on_model(model);
+    model->validate_nodes_and_infer_types();
     if (is_enabled_property(prepared_properties, std::string(::intel_npu::NPUW_UNQDQ::key()))) {
         ov::npuw::CollapseUNQDQ pass;
         pass.run_on_model(model);

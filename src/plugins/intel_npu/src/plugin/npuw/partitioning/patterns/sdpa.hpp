@@ -52,6 +52,21 @@ public:
     SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag);
 };
 
+class GQADecomposedSDPA : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::attn::GQADecomposedSDPA");
+    static constexpr const char* pattern_name() {
+        return "GQADecomposedSDPA";
+    }
+    static constexpr const char* isolation_tag() {
+        return "attn";
+    }
+    static constexpr const char* group_name() {
+        return "attn";
+    }
+    GQADecomposedSDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& isol_tag);
+};
+
 }  // namespace attn
 
 namespace regularize {

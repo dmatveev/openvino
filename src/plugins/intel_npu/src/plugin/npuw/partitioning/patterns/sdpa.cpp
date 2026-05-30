@@ -85,7 +85,7 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
 
 /*
     Decomposed SDPA Pattern:
-            Convert
+          opt:Convert
                 \       /
                  Concat
                     |
@@ -93,7 +93,11 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
                     |
                 opt:Broadcast   Convert
                     |       \       /
-                opt:Reshape       Concat
+                opt:Reshape   opt:Transpose
+                    |           |
+                opt:Transpose   opt:Convert
+                    |           \       /
+                    |            Concat
         \           /           |
             MatMul           opt:Unsqueeze
     \       /                   |
@@ -111,7 +115,8 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
 
 SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
                                const std::string& isol_tag) {
-    auto convert1 = opp::wrap_type<ov::op::v0::Convert>({opp::any_input()});
+    auto kv1_source = opp::any_input();
+    auto convert1 = opp::optional<ov::op::v0::Convert>({kv1_source});
     auto concat1 = opp::wrap_type<ov::op::v0::Concat>({convert1, opp::any_input()});
 
     // GQA optional nodes — require single consumer so shared KV (e.g. Gemma4) does not
@@ -124,20 +129,22 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
     auto unsqueeze1 = opp::optional<ov::op::v0::Unsqueeze>({concat1, opp::any_input()}, single_user);
     auto broadcast1 = opp::optional<ov::op::v3::Broadcast>({unsqueeze1, opp::any_input()}, single_user);
     auto reshape1 = opp::optional<ov::op::v1::Reshape>({broadcast1, opp::any_input()}, single_user);
+    auto transpose1 = opp::optional<ov::op::v1::Transpose>({reshape1, opp::any_input()}, single_user);
 
-    auto convert2 = opp::wrap_type<ov::op::v0::Convert>({opp::any_input()});
+    auto kv2_source = opp::any_input();
+    auto convert2 = opp::optional<ov::op::v0::Convert>({kv2_source});
     auto concat2 = opp::wrap_type<ov::op::v0::Concat>({convert2, opp::any_input()});
 
     // GQA optional nodes — same single-consumer guard
     auto unsqueeze2 = opp::optional<ov::op::v0::Unsqueeze>({concat2, opp::any_input()}, single_user);
     auto broadcast2 = opp::optional<ov::op::v3::Broadcast>({unsqueeze2, opp::any_input()}, single_user);
     auto reshape2 = opp::optional<ov::op::v1::Reshape>({broadcast2, opp::any_input()}, single_user);
-
-    auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), reshape1});
+    auto transpose2 = opp::optional<ov::op::v1::Transpose>({reshape2, opp::any_input()}, single_user);
+    auto matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), transpose1});
     auto add = opp::wrap_type<ov::op::v1::Add>({matmul1, opp::any_input()});
     auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
 
-    auto matmul2 = opp::wrap_type<ov::op::v0::MatMul>({softmax, reshape2});
+    auto matmul2 = opp::wrap_type<ov::op::v0::MatMul>({softmax, transpose2});
     auto transpose = opp::wrap_type<ov::op::v1::Transpose>({matmul2, opp::any_input()});
     auto reshape3 = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
 
@@ -164,12 +171,14 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
         isolate_matched(unsqueeze1);
         isolate_matched(broadcast1);
         isolate_matched(reshape1);
+        isolate_matched(transpose1);
 
         isolate_matched(convert2);
         isolate_matched(concat2);
         isolate_matched(unsqueeze2);
         isolate_matched(broadcast2);
         isolate_matched(reshape2);
+        isolate_matched(transpose2);
 
         isolate_matched(matmul1);
         isolate_matched(add);
@@ -182,6 +191,88 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
     };
 
     register_matcher(std::make_shared<opp::Matcher>(reshape3, "TagSDPADecomposed"), std::move(callback));
+}
+
+/*
+    GQA decomposed to unrolled SDPA with repeat-by-concat K/V expansion:
+
+        cache/value source
+              |
+           Reshape
+              |
+         Concat(x4)
+              |
+           Reshape
+              |
+            MatMul
+              |
+             Add
+              |
+           Softmax
+              |
+            MatMul
+              |
+          Transpose
+              |
+           Reshape
+*/
+
+GQADecomposedSDPA::GQADecomposedSDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+                                     const std::string& isol_tag) {
+    auto key_pre_reshape = opp::wrap_type<ov::op::v1::Reshape>({opp::any_input(), opp::any_input()});
+    auto key_repeat = opp::wrap_type<ov::op::v0::Concat>(
+        {key_pre_reshape, key_pre_reshape, key_pre_reshape, key_pre_reshape});
+    auto key_post_reshape = opp::wrap_type<ov::op::v1::Reshape>({key_repeat, opp::any_input()});
+
+    auto value_pre_reshape = opp::wrap_type<ov::op::v1::Reshape>({opp::any_input(), opp::any_input()});
+    auto value_repeat = opp::wrap_type<ov::op::v0::Concat>(
+        {value_pre_reshape, value_pre_reshape, value_pre_reshape, value_pre_reshape});
+    auto value_post_reshape = opp::wrap_type<ov::op::v1::Reshape>({value_repeat, opp::any_input()});
+
+    auto matmul_qk = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), key_post_reshape});
+    auto add = opp::wrap_type<ov::op::v1::Add>({matmul_qk, opp::any_input()});
+    auto softmax = opp::wrap_type<ov::op::v8::Softmax>({add});
+    auto matmul_av = opp::wrap_type<ov::op::v0::MatMul>({softmax, value_post_reshape});
+    auto transpose = opp::wrap_type<ov::op::v1::Transpose>({matmul_av, opp::any_input()});
+    auto reshape = opp::wrap_type<ov::op::v1::Reshape>({transpose, opp::any_input()});
+
+    auto node_to_gptr = snapshot->getNodeToGroupMap();
+
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        LOG_DEBUG("Decomposed GQA->SDPA pattern matched!");
+
+        auto& node_to_output = m.get_pattern_value_map();
+
+        auto isolate = [&](const std::shared_ptr<ov::Node>& node) {
+            auto it = node_to_gptr->find(node);
+            if (it != node_to_gptr->end()) {
+                it->second->isolate(isol_tag);
+            }
+        };
+
+        auto isolate_matched = [&](const auto& pattern) {
+            if (auto it = node_to_output.find(pattern); it != node_to_output.end()) {
+                isolate(it->second.get_node_shared_ptr());
+            }
+        };
+
+        isolate_matched(key_pre_reshape);
+        isolate_matched(key_repeat);
+        isolate_matched(key_post_reshape);
+        isolate_matched(matmul_qk);
+        isolate_matched(add);
+        isolate_matched(softmax);
+        isolate_matched(value_pre_reshape);
+        isolate_matched(value_repeat);
+        isolate_matched(value_post_reshape);
+        isolate_matched(matmul_av);
+        isolate_matched(transpose);
+        isolate_matched(reshape);
+
+        return false;
+    };
+
+    register_matcher(std::make_shared<opp::Matcher>(reshape, "TagGQADecomposedSDPA"), std::move(callback));
 }
 
 }  // namespace attn

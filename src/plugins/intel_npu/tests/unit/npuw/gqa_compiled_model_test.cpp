@@ -15,9 +15,12 @@
 #include "openvino/op/convert.hpp"
 #include "openvino/op/fake_quantize.hpp"
 #include "openvino/op/group_query_attention.hpp"
+#include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/softmax.hpp"
 #include "openvino/op/subtract.hpp"
 
 namespace {
@@ -175,7 +178,7 @@ TEST_F(GQACompiledModelTest, AddsExpectedNpuwDefaultsBeforeInnerCompilation) {
     EXPECT_EQ(call.props.at("NPUW_ONLINE_ISOLATE").as<std::string>(), "ATTN");
     EXPECT_EQ(call.props.at("NPUW_FOLD_ONLY").as<std::string>(), "attn");
     EXPECT_EQ(call.props.at("NPUW_ATTN").as<std::string>(), "STATIC");
-    EXPECT_EQ(call.props.at("NPUW_ONLINE_KEEP_BLOCK_SIZE").as<std::string>(), "9");
+    EXPECT_EQ(call.props.at("NPUW_ONLINE_KEEP_BLOCK_SIZE").as<std::string>(), "4");
 }
 
 TEST_F(GQACompiledModelTest, KeepsUserProvidedLowLevelOverrides) {
@@ -197,7 +200,7 @@ TEST_F(GQACompiledModelTest, KeepsUserProvidedLowLevelOverrides) {
     EXPECT_EQ(call.props.at("NPUW_FOLD").as<std::string>(), "YES");
 }
 
-TEST_F(GQACompiledModelTest, PassesGqaModelThroughWithoutDecomposition) {
+TEST_F(GQACompiledModelTest, DecomposesAndUnrollsGqaModelDuringPreparation) {
     auto model = build_group_query_attention_model();
     ASSERT_GT(count_ops<ov::op::internal::GroupQueryAttention>(model), 0u);
 
@@ -207,10 +210,11 @@ TEST_F(GQACompiledModelTest, PassesGqaModelThroughWithoutDecomposition) {
     ASSERT_NO_THROW(compiled = create_compiled_model(model, {}, recorder));
     ASSERT_NE(compiled, nullptr);
 
-    // GQA model is passed through unchanged — the online partitioner handles
-    // isolation and folding of GQA blocks via the NPUW_FOLD_ONLY=attn path.
     const auto& call = recorder.only_call();
-    EXPECT_GT(count_ops<ov::op::internal::GroupQueryAttention>(call.model), 0u);
+    EXPECT_EQ(count_ops<ov::op::internal::GroupQueryAttention>(call.model), 0u);
+    EXPECT_EQ(count_ops<ov::op::v13::ScaledDotProductAttention>(call.model), 0u);
+    EXPECT_GT(count_ops<ov::op::v8::Softmax>(call.model), 0u);
+    EXPECT_GT(count_ops<ov::op::v0::MatMul>(call.model), 1u);
 }
 
 TEST_F(GQACompiledModelTest, AppliesUNQDQCleanupDuringPreparationWhenEnabled) {

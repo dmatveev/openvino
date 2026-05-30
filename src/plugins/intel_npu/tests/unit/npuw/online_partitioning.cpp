@@ -110,6 +110,10 @@ class IsRegularParameterCaseParametrized : public ::testing::TestWithParam<std::
 class IsRegularCrossGroupConsumerCaseParametrized
     : public ::testing::TestWithParam<std::tuple<std::vector<std::size_t>, bool>> {};
 
+std::shared_ptr<ov::op::v0::Constant> i64Const(const ov::Shape& shape, std::initializer_list<int64_t> values) {
+    return ov::op::v0::Constant::create(ov::element::i64, shape, values);
+}
+
 };  // namespace
 
 TEST(OnlinePartitioningTest, Partitioning_IsTheSame_SmallModel) {
@@ -538,6 +542,118 @@ TEST(OnlinePartitioningTest, Partitioning_Compiler_Compute_RepeatedModel) {
         EXPECT_LT(iter_fr, sizes_fr.size());
         EXPECT_EQ(snap->graphSize(), sizes_fr[iter_fr++]);
     });
+}
+
+TEST(OnlinePartitioningTest, Partitioning_Compiler_AttnDecomposed_WithoutConvert) {
+    auto query = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 2, 4, 3});
+    auto past_k = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 2, 5, 3});
+    auto curr_k = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 2, 1, 3});
+    auto past_v = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 2, 5, 5});
+    auto curr_v = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 2, 1, 5});
+
+    auto concat_k = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past_k, curr_k}, 2);
+    auto reshape_k = std::make_shared<ov::op::v1::Reshape>(concat_k, i64Const({4}, {1, 2, 6, 3}), false);
+    auto transpose_k =
+        std::make_shared<ov::op::v1::Transpose>(reshape_k, i64Const({4}, {0, 1, 3, 2}));
+
+    auto matmul_qk = std::make_shared<ov::op::v0::MatMul>(query, transpose_k, false, false);
+    auto bias = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 2, 4, 6}, {0.f});
+    auto add = std::make_shared<ov::op::v1::Add>(matmul_qk, bias);
+    auto softmax = std::make_shared<ov::op::v8::Softmax>(add, 3);
+
+    auto concat_v = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past_v, curr_v}, 2);
+    auto reshape_v = std::make_shared<ov::op::v1::Reshape>(concat_v, i64Const({4}, {1, 2, 6, 5}), false);
+
+    auto matmul_av = std::make_shared<ov::op::v0::MatMul>(softmax, reshape_v, false, false);
+    auto transpose_out =
+        std::make_shared<ov::op::v1::Transpose>(matmul_av, i64Const({4}, {0, 2, 1, 3}));
+    auto reshape_out =
+        std::make_shared<ov::op::v1::Reshape>(transpose_out, i64Const({3}, {1, 4, 10}), false);
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{reshape_out},
+                                             ov::ParameterVector{query, past_k, curr_k, past_v, curr_v});
+
+    auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
+    ov::npuw::online::PassContext ctx;
+    ctx.isolates = {{ov::npuw::online::PatternType::PATTERN, "SDPADecomposed", "attn"}};
+    snap->setCtx(ctx);
+
+    snap->buildGraph();
+    snap->earlyRegroup();
+
+    const auto& node_to_group = *snap->getNodeToGroupMap();
+    EXPECT_EQ(node_to_group.at(concat_k)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(reshape_k)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(transpose_k)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(matmul_qk)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(add)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(softmax)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(concat_v)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(reshape_v)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(matmul_av)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(transpose_out)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(reshape_out)->isolatedTag(), "attn");
+}
+
+TEST(OnlinePartitioningTest, Partitioning_Compiler_GqaDecomposedSdpa_RepeatByConcat) {
+    auto query = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 40, 512, 128});
+    auto key_cache = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 10, 8192, 128});
+    auto value_cache = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 10, 8192, 128});
+
+    auto key_pre_reshape =
+        std::make_shared<ov::op::v1::Reshape>(key_cache, i64Const({5}, {1, 10, 1, 8192, 128}), false);
+    auto key_repeat = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{key_pre_reshape, key_pre_reshape, key_pre_reshape, key_pre_reshape},
+        2);
+    auto key_post_reshape =
+        std::make_shared<ov::op::v1::Reshape>(key_repeat, i64Const({4}, {1, 40, 8192, 128}), false);
+
+    auto matmul_qk = std::make_shared<ov::op::v0::MatMul>(query, key_post_reshape, false, true);
+    auto bias = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{512, 8192}, {0.f});
+    auto add = std::make_shared<ov::op::v1::Add>(matmul_qk, bias);
+    auto softmax = std::make_shared<ov::op::v8::Softmax>(add, -1);
+
+    auto value_pre_reshape =
+        std::make_shared<ov::op::v1::Reshape>(value_cache, i64Const({5}, {1, 10, 1, 8192, 128}), false);
+    auto value_repeat = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{value_pre_reshape, value_pre_reshape, value_pre_reshape, value_pre_reshape},
+        2);
+    auto value_post_reshape =
+        std::make_shared<ov::op::v1::Reshape>(value_repeat, i64Const({4}, {1, 40, 8192, 128}), false);
+
+    auto matmul_av = std::make_shared<ov::op::v0::MatMul>(softmax, value_post_reshape, false, false);
+    auto transpose_out =
+        std::make_shared<ov::op::v1::Transpose>(matmul_av, i64Const({4}, {0, 2, 1, 3}));
+    auto reshape_out =
+        std::make_shared<ov::op::v1::Reshape>(transpose_out, i64Const({3}, {1, 512, 5120}), false);
+
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{reshape_out},
+                                             ov::ParameterVector{query, key_cache, value_cache});
+
+    auto snap = std::make_shared<ov::npuw::online::Snapshot>(model);
+    ov::npuw::online::PassContext ctx;
+    ctx.isolates = {{ov::npuw::online::PatternType::PATTERN, "GQADecomposedSDPA", "attn"}};
+    snap->setCtx(ctx);
+
+    snap->buildGraph();
+    snap->earlyRegroup();
+
+    const auto& node_to_group = *snap->getNodeToGroupMap();
+    EXPECT_NE(node_to_group.at(query)->isolatedTag(), "attn");
+    EXPECT_NE(node_to_group.at(key_cache)->isolatedTag(), "attn");
+    EXPECT_NE(node_to_group.at(value_cache)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(key_pre_reshape)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(key_repeat)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(key_post_reshape)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(matmul_qk)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(add)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(softmax)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(value_pre_reshape)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(value_repeat)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(value_post_reshape)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(matmul_av)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(transpose_out)->isolatedTag(), "attn");
+    EXPECT_EQ(node_to_group.at(reshape_out)->isolatedTag(), "attn");
 }
 
 TEST(OnlinePartitioningTest, Partitioning_Avoids_Pipeline_None) {
