@@ -1124,6 +1124,113 @@ DCOFFPassReshape::DCOFFPassReshape(DCOffMode dcoff_mode, ov::element::Type dcoff
     register_matcher(std::make_shared<opp::Matcher>(reshpe, "TagDCOFFReshape"), std::move(callback));
 }
 }  // namespace AsymmZP
+
+//------------------------------------------------------------------------------
+// Pattern: AsymmZP2b — 2-bit weights with u2 asymmetric zero points.
+//
+// Triggered by NPUW_DCOFF_TYPE=i4 + NPUW_DCOFF_SUB=YES.
+//
+// On the left is the incoming IR (from 2-bit ONNX export):
+//
+//   "tensor"     "zero point"   "scale"
+//   Parameter:A  Parameter:B    any
+//      u2            u2          :
+//       :              :         :
+//       V              :         :
+//     Convert          :         :
+//      f32             V         :
+//       :            Convert     :
+//       :             f32        :
+//       V              V         V
+//       Subtract    → Multiply
+//        f32           f32
+//          :            :
+//          V            V
+//           Reshape / ...
+//
+// The transformation changes it to the canonical 4-bit group-quant form:
+//
+//   Parameter:A    "scale"
+//     i4             any
+//      :              :
+//      V              :
+//    Convert          :
+//     f32             V
+//      :     →    Multiply
+//      V            f32
+//   Reshape / ...
+//
+// The runtime unpack closure computes sub(u2_A, u2_B) → i4 on host.
+//
+namespace AsymmZP2b {
+
+DCOFFPassReshape::DCOFFPassReshape(ov::element::Type dcoff_type, DCOFFParamRef pref) {
+    auto paramA = opp::wrap_type<ov::op::v0::Parameter>();
+    auto paramB = opp::wrap_type<ov::op::v0::Parameter>();
+    auto cvtA = opp::wrap_type<ov::op::v0::Convert>({paramA});
+    auto cvtB = opp::wrap_type<ov::op::v0::Convert>({paramB});
+    auto subtr = opp::wrap_type<ov::op::v1::Subtract>({cvtA, cvtB});
+    auto mulply = opp::wrap_type<ov::op::v1::Multiply>({subtr, opp::any_input()});
+    auto transposeopt = opp::optional<ov::op::v1::Transpose>({mulply->output(0), opp::any_input()});
+    auto scalar = opp::wrap_type<ov::op::v0::Constant>();
+    auto reshpe = opp::wrap_type<ov::op::v1::Reshape>({transposeopt, scalar});
+
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+        auto matched_nodeA = node_to_output.at(paramA).get_node_shared_ptr();
+        auto matched_nodeB = node_to_output.at(paramB).get_node_shared_ptr();
+
+        NPUW_ASSERT(ov::op::util::is_parameter(matched_nodeA));
+        NPUW_ASSERT(ov::op::util::is_parameter(matched_nodeB));
+
+        auto matched_paramA = std::static_pointer_cast<ov::op::v0::Parameter>(matched_nodeA);
+        auto matched_paramB = std::static_pointer_cast<ov::op::v0::Parameter>(matched_nodeB);
+
+        if (ov::element::u2 != matched_paramA->get_element_type() ||
+            ov::element::u2 != matched_paramB->get_element_type()) {
+            return false;
+        }
+
+        LOG_DEBUG("AsymmZP2b: matched " << matched_paramA << " + " << matched_paramB << ", changing weight type to "
+                                        << dcoff_type);
+
+        // Retype the weight Parameter to the target integer type (i4).
+        matched_paramA->set_element_type(dcoff_type);
+
+        // Record the zero-point Parameter so build_remap removes it from the
+        // function body and stores its tensor for the runtime unpack closure.
+        pref.get().zerops_asymm[matched_paramA] = matched_paramB;
+
+        // Insert a Convert(paramA → f32) before the Multiply to replace the
+        // now-dropped Subtract path.
+        const auto& matched_mulply_out = node_to_output.at(mulply);
+        const auto new_cvt_type = matched_mulply_out.get_element_type();  // f32 or f16
+        auto new_cvt = std::make_shared<ov::op::v0::Convert>(matched_paramA, new_cvt_type);
+
+        // Disconnect the Subtract from the Multiply (remove the Subtract→Multiply edge).
+        // Leave cvtA→Subtract and cvtB→Subtract intact so that Subtract has proper
+        // connected inputs; it becomes dead code (no output readers) which OV Validate
+        // handles correctly without partial-input inference errors.
+        auto drop_outputs = [](const std::shared_ptr<ov::Node>& node) {
+            for (auto&& out : node->outputs()) {
+                for (auto&& reader : out.get_target_inputs()) {
+                    out.remove_target_input(reader);
+                }
+            }
+        };
+        drop_outputs(node_to_output.at(subtr).get_node_shared_ptr());
+
+        // Re-wire Multiply's port 0 to the new Convert.
+        node_to_output.at(mulply).get_node_shared_ptr()->input(0).replace_source_output(new_cvt->output(0));
+
+        LOG_DEBUG("Done");
+        return false;  // root hasn't changed (Reshape is still the root)
+    };
+
+    register_matcher(std::make_shared<opp::Matcher>(reshpe, "TagDCOFFAsymmZP2b"), std::move(callback));
+}
+
+}  // namespace AsymmZP2b
 }  // namespace patterns
 }  // namespace npuw
 }  // namespace ov
