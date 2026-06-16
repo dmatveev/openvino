@@ -93,6 +93,14 @@ void unpack_f8f16_scale(const ov::SoPtr<ov::ITensor>& from,
                         const ov::SoPtr<ov::ITensor>& to,
                         const ov::npuw::util::UnpackOptions& unpack_options);
 
+// Unpack 2-bit unsigned weights, subtract 2-bit per-group zero points,
+// and store as signed 4-bit:  out[i] = (i4)(from[i] - zerop[i/group_size])
+// Supports scalar, per-element, and per-group ZP broadcast.
+void unpack_u2i4(const ov::SoPtr<ov::ITensor>& from,
+                 const ov::SoPtr<ov::ITensor>& zerop,
+                 const ov::SoPtr<ov::ITensor>& to,
+                 const ov::npuw::util::UnpackOptions& unpack_options);
+
 }  // namespace XARCH
 }  // namespace util
 }  // namespace npuw

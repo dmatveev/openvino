@@ -383,6 +383,13 @@ void ov::npuw::util::unpack(const ov::SoPtr<ov::ITensor>& from,
     }
 }
 
+void ov::npuw::util::unpack_u2i4(const ov::SoPtr<ov::ITensor>& from,
+                                 const ov::SoPtr<ov::ITensor>& zerop,
+                                 const ov::SoPtr<ov::ITensor>& to,
+                                 const UnpackOptions& unpack_options) {
+    ov::npuw::util::XARCH::unpack_u2i4(from, zerop, to, unpack_options);
+}
+
 void ov::npuw::util::gather(const ov::SoPtr<ov::ITensor>& src,
                             const ov::SoPtr<ov::ITensor>& idx,
                             const ov::SoPtr<ov::ITensor>& dst) {

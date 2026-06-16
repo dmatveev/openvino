@@ -1742,6 +1742,123 @@ void ov::npuw::util::XARCH::transpose_f32(const float* src, float* dst, size_t r
 #endif
 }
 
+void ov::npuw::util::XARCH::unpack_u2i4(const ov::SoPtr<ov::ITensor>& from,
+                                        const ov::SoPtr<ov::ITensor>& zerop,
+                                        const ov::SoPtr<ov::ITensor>& to,
+                                        const ov::npuw::util::UnpackOptions& unpack_options) {
+    NPUW_ASSERT(from->get_element_type() == ov::element::u2);
+    NPUW_ASSERT(zerop->get_element_type() == ov::element::u2);
+    NPUW_ASSERT(to->get_element_type() == ov::element::i4);
+
+    const std::size_t num_elems = from->get_size();
+    const std::size_t zp_size = zerop->get_size();
+    NPUW_ASSERT(num_elems == to->get_size());
+    NPUW_ASSERT(zp_size == 1 || zp_size == num_elems || num_elems % zp_size == 0);
+
+    const std::size_t group_size = num_elems / zp_size;  // elements per ZP entry
+
+    const uint8_t* from_data = reinterpret_cast<const uint8_t*>(from->data());
+    const uint8_t* zerop_data = reinterpret_cast<const uint8_t*>(zerop->data());
+    uint8_t* to_data = reinterpret_cast<uint8_t*>(to->data());
+
+    // u2: 4 elements packed per byte.  Extract one element at linear index idx.
+    auto get_u2 = [](const uint8_t* data, std::size_t idx) -> uint8_t {
+        return (data[idx / 4] >> ((idx % 4) * 2)) & 0x3u;
+    };
+
+#if defined(HAVE_AVX2)
+    // Fast path: group_size is a multiple of 64.
+    // Each 64-element chunk = 16 u2 bytes → 32 i4 bytes, processed with SSE.
+    //
+    // Extraction of four 2-bit fields per byte:
+    //   _mm_srli_epi16 shifts 16-bit lanes; bits from the neighbouring byte
+    //   leak into bits [7:2] of the low byte, but the 0x03 mask removes them.
+    //
+    // Packing back to i4:
+    //   e values are in [0x00..0x0F] after the 0x0F mask, so slli_epi16(e,4)
+    //   has zero cross-byte leakage (upper nibble of source byte is 0).
+    if (group_size % 64 == 0) {
+        const std::size_t num_groups = zp_size;
+        const std::size_t u2_bytes_per_g = group_size / 4;  // u2: 4 elems/byte
+        const std::size_t i4_bytes_per_g = group_size / 2;  // i4: 2 elems/byte
+        const std::size_t chunks_per_g = group_size / 64;   // 16 u2 bytes per SSE chunk
+
+        const __m128i mask2 = _mm_set1_epi8(0x03);
+        const __m128i mask4 = _mm_set1_epi8(0x0F);
+
+        // Heuristic: batch enough groups per TBB task to amortise dispatch.
+        std::size_t stride = num_groups;
+        if (unpack_options.nPartitions) {
+            stride = num_groups / unpack_options.nPartitions;
+            if (stride == 0)
+                stride = 1;
+        }
+        const std::size_t num_tasks = (num_groups + stride - 1) / stride;
+
+        auto unpack_body = [&](std::size_t task) {
+            const std::size_t g_start = task * stride;
+            const std::size_t g_end = std::min(num_groups, g_start + stride);
+            for (std::size_t g = g_start; g < g_end; ++g) {
+                const uint8_t zp = get_u2(zerop_data, g);
+                const __m128i zv = _mm_set1_epi8(static_cast<int8_t>(zp));
+
+                const uint8_t* in_g = from_data + g * u2_bytes_per_g;
+                uint8_t* out_g = to_data + g * i4_bytes_per_g;
+
+                for (std::size_t c = 0; c < chunks_per_g; ++c) {
+                    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in_g + c * 16));
+
+                    __m128i e0 = _mm_and_si128(v, mask2);
+                    __m128i e1 = _mm_and_si128(_mm_srli_epi16(v, 2), mask2);
+                    __m128i e2 = _mm_and_si128(_mm_srli_epi16(v, 4), mask2);
+                    __m128i e3 = _mm_and_si128(_mm_srli_epi16(v, 6), mask2);
+
+                    e0 = _mm_sub_epi8(e0, zv);
+                    e1 = _mm_sub_epi8(e1, zv);
+                    e2 = _mm_sub_epi8(e2, zv);
+                    e3 = _mm_sub_epi8(e3, zv);
+
+                    e0 = _mm_and_si128(e0, mask4);
+                    e1 = _mm_and_si128(e1, mask4);
+                    e2 = _mm_and_si128(e2, mask4);
+                    e3 = _mm_and_si128(e3, mask4);
+
+                    __m128i out_lo = _mm_or_si128(e0, _mm_slli_epi16(e1, 4));
+                    __m128i out_hi = _mm_or_si128(e2, _mm_slli_epi16(e3, 4));
+
+                    __m128i r0 = _mm_unpacklo_epi8(out_lo, out_hi);
+                    __m128i r1 = _mm_unpackhi_epi8(out_lo, out_hi);
+
+                    _mm_storeu_si128(reinterpret_cast<__m128i*>(out_g + c * 32), r0);
+                    _mm_storeu_si128(reinterpret_cast<__m128i*>(out_g + c * 32 + 16), r1);
+                }
+            }
+        };
+
+        if (unpack_options.bUseOvParallelFor) {
+            ov::parallel_for(num_tasks, unpack_body);
+        } else {
+            for (std::size_t t = 0; t < num_tasks; ++t) {
+                unpack_body(t);
+            }
+        }
+        return;
+    }
+#endif  // HAVE_AVX2
+
+    // Scalar fallback for group sizes not divisible by 64.
+    auto set_i4 = [](uint8_t* data, std::size_t idx, int8_t val) {
+        const std::size_t bit_shift = (idx % 2) * 4;
+        data[idx / 2] = static_cast<uint8_t>((data[idx / 2] & ~(0xFu << bit_shift)) |
+                                             ((static_cast<uint8_t>(val) & 0xFu) << bit_shift));
+    };
+    for (std::size_t i = 0; i < num_elems; ++i) {
+        const uint8_t w = get_u2(from_data, i);
+        const uint8_t z = get_u2(zerop_data, i / group_size);
+        set_i4(to_data, i, static_cast<int8_t>(w) - static_cast<int8_t>(z));
+    }
+}
+
 void ov::npuw::util::XARCH::unpack_f8f16_scale(const ov::SoPtr<ov::ITensor>& from,
                                                const ov::SoPtr<ov::ITensor>& scale,
                                                const ov::SoPtr<ov::ITensor>& to,
@@ -1815,14 +1932,16 @@ void ov::npuw::util::XARCH::unpack_f8f16_scale(const ov::SoPtr<ov::ITensor>& fro
         _mm_storeu_si128(reinterpret_cast<__m128i*>(bdst + 8), out_hi);
     };
 
-    // Work partitioning over scale dimension (similar pattern to other unpack_*_scale functions)
+    // Work partitioning over scale dimension (similar pattern to other
+    // unpack_*_scale functions)
     size_t stride = 1;
     if (unpack_options.nPartitions) {
         if (unpack_options.bStrictPartitioning) {
             stride = (stotal + unpack_options.nPartitions - 1) / unpack_options.nPartitions;
         } else {
             // Heuristic: ensure minimum intrinsic workload per thread.
-            // Require at least 2048 vector blocks per thread (if possible).
+            // Require at least 2048 vector blocks per thread (if
+            // possible).
             size_t vecBlocksPerScale = elemsPerScale / VEC;
             if (vecBlocksPerScale == 0)
                 vecBlocksPerScale = 1;
@@ -1862,7 +1981,8 @@ void ov::npuw::util::XARCH::unpack_f8f16_scale(const ov::SoPtr<ov::ITensor>& fro
                 for (size_t t = 0; t < tail; ++t) {
                     uint8_t v = src_scale_base[offset + t];
                     uint16_t h;
-                    // Lossy direct mapping for tail (no special cases like NaN/Inf)
+                    // Lossy direct mapping for tail (no special cases
+                    // like NaN/Inf)
                     if (ftype == ov::element::f8e4m3) {
                         uint8_t sign = (v & 0x80) >> 7;
                         uint8_t exp = (v & 0x78) >> 3;

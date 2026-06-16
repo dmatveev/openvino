@@ -2433,6 +2433,8 @@ void Partitioner::decompressionCutOff(const std::string& func_name) {
             dcoff_type = ov::element::f16;
         } else if (dcoff_type_opt == "f32") {
             dcoff_type = ov::element::f32;
+        } else if (dcoff_type_opt == "i4") {
+            dcoff_type = ov::element::i4;
         } else {
             OPENVINO_THROW("Unknwon dcoff type: ", dcoff_type_opt);
         }
@@ -2496,12 +2498,22 @@ void Partitioner::decompressionCutOff(const std::string& func_name) {
         // Asymmetric zeropoints
         rewr.add_matcher<ov::npuw::patterns::AsymmZP::DCOFFPassReshape>(dcoff_mode, dcoff_type, std::ref(params_to));
 
+        // 2-bit asymmetric zero-point → i4 (NPUW_DCOFF_SUB=YES + NPUW_DCOFF_TYPE=i4)
+        if (cfg.get<::intel_npu::NPUW_DCOFF_SUB>()) {
+            if (dcoff_type != ov::element::i4) {
+                LOG_WARN(::intel_npu::NPUW_DCOFF_SUB().key()
+                         << " is set but DCOFF type is not i4 - ignoring sub option");
+            } else {
+                rewr.add_matcher<ov::npuw::patterns::AsymmZP2b::DCOFFPassReshape>(dcoff_type, std::ref(params_to));
+            }
+        }
+
         rewr.run_on_model(f._model);
 
         ov::pass::Validate val;
         val.run_on_model(f._model);
 
-        if (!params_to.scales.empty()) {
+        if (!params_to.scales.empty() || !params_to.zerops_asymm.empty()) {
             LOG_VERB("Weight scaling was removed from the function body"
                      " -- updating the function closure");
             LOG_BLOCK();

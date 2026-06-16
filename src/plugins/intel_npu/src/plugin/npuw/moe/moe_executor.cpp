@@ -620,6 +620,11 @@ void MoEExecutor::unpack_single_expert_closure(std::size_t idx, RqPtr request, s
                                            clparam);
                 } else if (!comp_model_desc.scales.empty() && comp_model_desc.scales[cidx]) {
                     ov::npuw::util::unpack(sliced_weight, ov::get_tensor_impl(comp_model_desc.scales[cidx]), clparam);
+                } else if (!comp_model_desc.zerops.empty() && comp_model_desc.zerops[cidx]) {
+                    // DCOFF_SUB: unpack 2-bit weights by subtracting 2-bit zero points → i4
+                    ov::npuw::util::unpack_u2i4(sliced_weight,
+                                                ov::get_tensor_impl(comp_model_desc.zerops[cidx]),
+                                                clparam);
                 } else {
                     ov::npuw::util::unpack(sliced_weight, clparam);
                 }

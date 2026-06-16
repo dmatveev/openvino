@@ -32,6 +32,7 @@ INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_NO_COPY, bool, false, ov::intel_npu::npuw::p
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ATTN_HFA_FUSED, bool, false, ov::intel_npu::npuw::partitioning, attn_hfa_fused, "NPUW_ATTN_HFA_FUSED", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_DCOFF_TYPE, std::string, "", ov::intel_npu::npuw::partitioning, dcoff_type, "NPUW_DCOFF_TYPE", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_DCOFF_SCALE, bool, false, ov::intel_npu::npuw::partitioning, dcoff_with_scale, "NPUW_DCOFF_SCALE", ROOT, EXPOSED, CACHED, ALL)
+INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_DCOFF_SUB, bool, false, ov::intel_npu::npuw::partitioning, dcoff_sub, "NPUW_DCOFF_SUB", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_FUNCALL_FOR_ALL, bool, false, ov::intel_npu::npuw::partitioning, funcall_for_all, "NPUW_FUNCALL_FOR_ALL", ROOT, EXPOSED, CACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_PARALLEL_COMPILE, bool, false, ov::intel_npu::npuw, parallel_compilation, "NPUW_PARALLEL_COMPILE", ROOT, HIDDEN, UNCACHED, ALL)
 INTEL_NPU_NPUW_SIMPLE_OPT(NPUW_ENSURE_COMPATIBILITY, bool, false, ov::intel_npu::npuw, ensure_compatibility, "NPUW_ENSURE_COMPATIBILITY", ROOT, EXPOSED, CACHED, ALL)

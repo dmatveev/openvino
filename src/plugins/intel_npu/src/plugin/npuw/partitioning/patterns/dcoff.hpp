@@ -192,6 +192,42 @@ public:
 
 }  // namespace AsymmZP
 
+namespace AsymmZP2b {
+
+// Pattern for 2-bit group-quantized weights with per-group zero points.
+// Triggered by NPUW_DCOFF_TYPE=i4 + NPUW_DCOFF_SUB=YES.
+//
+// Recognises:
+//   Parameter:A (u2)  Parameter:B (u2)  any_scale
+//        :                   :               :
+//        V                   :               :
+//      Convert               :               :
+//       f32                  V               :
+//        :                 Convert           :
+//        :                  f32              :
+//        V                   V              :
+//        Subtract            |             :
+//          f32               |             :
+//            :               |            :
+//            V               V           :
+//             Multiply (scale stays in graph)
+//               f32
+//                :
+//                V
+//              Reshape
+//
+// and replaces it with:
+//   Parameter:A (i4) → Convert(f32) → Multiply(scale) → Reshape → ...
+//
+// The runtime unpack closure computes sub(u2, u2) → i4 on host.
+class DCOFFPassReshape : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::AsymmZP2b::DCOFFPassReshape");
+    DCOFFPassReshape(ov::element::Type dcoff_type, DCOFFParamRef pref);
+};
+
+}  // namespace AsymmZP2b
+
 }  // namespace patterns
 }  // namespace npuw
 }  // namespace ov

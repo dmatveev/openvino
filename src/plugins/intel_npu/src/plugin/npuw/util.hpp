@@ -88,6 +88,14 @@ void unpack(const ov::SoPtr<ov::ITensor>& from,
             const ov::SoPtr<ov::ITensor>& to,
             const UnpackOptions& unpack_options = UnpackOptions{true, 16, false});
 
+// Unpack 2-bit unsigned weights and subtract 2-bit zero points to produce
+// signed 4-bit output:  out[i] = (int4)(from[i] - zerop[i])
+// Used by NPUW_DCOFF_TYPE=i4 + NPUW_DCOFF_SUB=YES.
+void unpack_u2i4(const ov::SoPtr<ov::ITensor>& from,
+                 const ov::SoPtr<ov::ITensor>& zerop,
+                 const ov::SoPtr<ov::ITensor>& to,
+                 const UnpackOptions& unpack_options = UnpackOptions{true, 16, false});
+
 void gather(const ov::SoPtr<ov::ITensor>& src, const ov::SoPtr<ov::ITensor>& idx, const ov::SoPtr<ov::ITensor>& dst);
 void gather_cb4(const ov::SoPtr<ov::ITensor>& src,
                 const ov::SoPtr<ov::ITensor>& idx,
