@@ -51,9 +51,15 @@ public:
 
 private:
     bool is_kv_output_locked(size_t output_index) const;
+    bool is_kv_input_locked(size_t input_index) const;
     int64_t read_seqlens_k_locked() const;
+    void prepare_kv_inputs_locked(int64_t seqlens_k_val) const;
     void scatter_kv_outputs_locked(int64_t seqlens_k_val) const;
 
+    // User-set tensors for KV inputs intercepted by the managed KV path.
+    mutable std::unordered_map<size_t, ov::SoPtr<ov::ITensor>> m_user_kv_input_tensors;
+    // Left-aligned working tensors forwarded to the inner request for each managed KV input.
+    mutable std::unordered_map<size_t, ov::SoPtr<ov::ITensor>> m_kv_input_working_tensors;
     // User-set tensors for KV outputs intercepted by the managed KV scatter path.
     mutable std::unordered_map<size_t, ov::SoPtr<ov::ITensor>> m_user_kv_tensors;
     // Correctly-sized working tensors forwarded to the inner request for each managed KV output.
@@ -94,6 +100,7 @@ private:
         ov::AnyMap properties;
         bool sliced = false;                        // true when the wrapper manages KV slicing/scatter itself
         std::string seqlens_k_name;                 // friendly name of the seqlens_k parameter
+        std::vector<size_t> sliced_input_indices;   // matching past_k/past_v input index for each sliced output
         std::vector<size_t> sliced_output_indices;  // which result indices are sliced by the wrapper
         std::vector<size_t> sliced_max_seqs;        // max_seq for each sliced output
         std::vector<bool> sliced_transposed;        // true when V output is transposed [1,H,head_size,max_seq]
@@ -122,6 +129,7 @@ private:
     std::shared_ptr<ov::npuw::ICompiledModel> m_compiled_model;
     bool m_sliced = false;
     std::string m_seqlens_k_name;
+    std::vector<size_t> m_sliced_input_indices;
     std::vector<size_t> m_sliced_output_indices;
     std::vector<size_t> m_sliced_max_seqs;
     std::vector<bool> m_sliced_transposed;  // per-output: true when V is [1,H,head_size,max_seq]

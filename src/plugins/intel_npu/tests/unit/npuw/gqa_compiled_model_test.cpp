@@ -5,8 +5,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gqa_compiled_model.hpp"
@@ -62,6 +64,48 @@ std::shared_ptr<ov::Model> build_group_query_attention_model() {
                                 std::make_shared<ov::op::v0::Result>(gqa->output(2))};
     ov::ParameterVector params = {query, key, value, past_key, past_value, seqlens_k, total_sequence_length};
     return std::make_shared<ov::Model>(results, params, "gqa_model");
+}
+
+std::shared_ptr<ov::Model> build_group_query_attention_model(std::size_t current_seq_len, bool transpose_v) {
+    auto query = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{1, 4, current_seq_len, 16});
+    auto key = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{1, 2, current_seq_len, 16});
+    auto value = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{1, 2, current_seq_len, 16});
+    auto past_key = std::make_shared<ov::op::v0::Parameter>(ov::element::f16, ov::Shape{1, 2, 8, 16});
+    auto past_value_host = std::make_shared<ov::op::v0::Parameter>(
+        ov::element::f16,
+        transpose_v ? ov::Shape{1, 2, 16, 8} : ov::Shape{1, 2, 8, 16});
+    auto seqlens_k = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::Shape{1});
+    auto total_sequence_length = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::Shape{1});
+
+    ov::Output<ov::Node> past_value = past_value_host;
+    if (transpose_v) {
+        past_value = std::make_shared<ov::op::v1::Transpose>(
+            past_value_host,
+            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 1, 3, 2}));
+    }
+
+    auto gqa = std::make_shared<ov::op::internal::GroupQueryAttention>(
+        ov::OutputVector{query, key, value, past_key, past_value, seqlens_k, total_sequence_length},
+        4,
+        2,
+        0.0f,
+        false,
+        false);
+
+    ov::Output<ov::Node> present_value = gqa->output(2);
+    if (transpose_v) {
+        present_value = std::make_shared<ov::op::v1::Transpose>(
+            gqa->output(2),
+            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 1, 3, 2}));
+    }
+
+    ov::ResultVector results = {std::make_shared<ov::op::v0::Result>(gqa->output(0)),
+                                std::make_shared<ov::op::v0::Result>(gqa->output(1)),
+                                std::make_shared<ov::op::v0::Result>(present_value)};
+    ov::ParameterVector params = {query, key, value, past_key, past_value_host, seqlens_k, total_sequence_length};
+    return std::make_shared<ov::Model>(results,
+                                       params,
+                                       transpose_v ? "gqa_model_transpose_v" : "gqa_model_notrans_v");
 }
 
 std::shared_ptr<ov::Model> build_unqdq_model(const ov::element::Type& input_type = ov::element::f32) {
@@ -229,6 +273,84 @@ public:
     ov::AnyMap last_set_properties;
 };
 
+class ManagedScatterMockCompiledModel;
+
+class ManagedScatterMockInferRequest final : public ov::ISyncInferRequest {
+public:
+    explicit ManagedScatterMockInferRequest(std::shared_ptr<const ManagedScatterMockCompiledModel> compiled_model);
+
+    void infer() override;
+    ov::SoPtr<ov::ITensor> get_tensor(const ov::Output<const ov::Node>& port) const override {
+        return ov::ISyncInferRequest::get_tensor(port);
+    }
+    void set_tensor(const ov::Output<const ov::Node>& port, const ov::SoPtr<ov::ITensor>& tensor) override {
+        ov::ISyncInferRequest::set_tensor(port, tensor);
+    }
+    void check_tensors() const override {}
+    std::vector<ov::SoPtr<ov::IVariableState>> query_state() const override {
+        return {};
+    }
+    std::vector<ov::ProfilingInfo> get_profiling_info() const override {
+        return {};
+    }
+
+private:
+    std::shared_ptr<const ManagedScatterMockCompiledModel> m_compiled_model;
+};
+
+class ManagedScatterMockCompiledModel final : public ov::npuw::ICompiledModel {
+public:
+    ManagedScatterMockCompiledModel(const std::shared_ptr<ov::Model>& model,
+                                    const std::shared_ptr<const ov::IPlugin>& plugin)
+        : ov::npuw::ICompiledModel(model, plugin) {}
+
+    void export_model(std::ostream&) const override {}
+    std::shared_ptr<const ov::Model> get_runtime_model() const override {
+        return {};
+    }
+    void set_property(const ov::AnyMap&) override {}
+    ov::Any get_property(const std::string&) const override {
+        return {};
+    }
+
+private:
+    std::shared_ptr<ov::ISyncInferRequest> create_sync_infer_request() const override {
+        auto self = std::static_pointer_cast<const ManagedScatterMockCompiledModel>(shared_from_this());
+        return std::make_shared<ManagedScatterMockInferRequest>(std::move(self));
+    }
+
+public:
+    std::unordered_map<std::size_t, ov::float16> fill_values;
+};
+
+ManagedScatterMockInferRequest::ManagedScatterMockInferRequest(
+    std::shared_ptr<const ManagedScatterMockCompiledModel> compiled_model)
+    : ov::ISyncInferRequest(compiled_model),
+      m_compiled_model(std::move(compiled_model)) {
+    for (const auto& input : get_compiled_model()->inputs()) {
+        ov::ISyncInferRequest::set_tensor(input,
+                                          ov::get_tensor_impl(ov::Tensor(input.get_element_type(), input.get_shape())));
+    }
+    for (const auto& output : get_compiled_model()->outputs()) {
+        ov::ISyncInferRequest::set_tensor(output,
+                                          ov::get_tensor_impl(ov::Tensor(output.get_element_type(), output.get_shape())));
+    }
+}
+
+void ManagedScatterMockInferRequest::infer() {
+    const auto& outputs = get_compiled_model()->outputs();
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        auto tensor = ov::ISyncInferRequest::get_tensor(outputs[i]);
+        std::memset(tensor->data(), 0, tensor->get_byte_size());
+        const auto it = m_compiled_model->fill_values.find(i);
+        if (it == m_compiled_model->fill_values.end()) {
+            continue;
+        }
+        auto* data = tensor->data<ov::float16>();
+        std::fill(data, data + tensor->get_size(), it->second);
+    }
+}
+
 
 class GQACompiledModelTest : public ::testing::Test {
 protected:
@@ -252,6 +374,27 @@ protected:
         auto props = base_props();
         merge_props(props, extra_props);
         return std::make_unique<ov::npuw::GQACompiledModel>(model, m_plugin, props, recorder.make_factory());
+    }
+
+    std::shared_ptr<ov::npuw::GQACompiledModel> create_managed_scatter_model(const std::shared_ptr<ov::Model>& model,
+                                                                              bool transpose_v) const {
+        auto props = base_props();
+        props["NPUW_GQA_MANAGED"] = "YES";
+        auto factory = [transpose_v](const std::shared_ptr<ov::Model>& inner_model,
+                                     const std::shared_ptr<const ov::IPlugin>& plugin,
+                                     const ov::AnyMap&) -> std::shared_ptr<ov::npuw::ICompiledModel> {
+            auto compiled = std::make_shared<ManagedScatterMockCompiledModel>(inner_model, plugin);
+            compiled->fill_values.emplace(1u, ov::float16{1.0f});
+            compiled->fill_values.emplace(2u, transpose_v ? ov::float16{2.0f} : ov::float16{3.0f});
+            return compiled;
+        };
+        return std::make_shared<ov::npuw::GQACompiledModel>(model, m_plugin, props, std::move(factory));
+    }
+
+    static ov::SoPtr<ov::ITensor> make_i32_scalar_tensor(int32_t value) {
+        ov::Tensor tensor(ov::element::i32, ov::Shape{1});
+        *tensor.data<int32_t>() = value;
+        return ov::get_tensor_impl(tensor);
     }
 
     std::shared_ptr<ov::IPlugin> m_plugin;
@@ -437,6 +580,99 @@ TEST_F(GQACompiledModelTest, ForwardsPropertyAccessToInnerCompiledModel) {
     compiled.set_property({{"NPUW_CWAI", "YES"}});
     EXPECT_EQ(inner->last_set_properties.at("NPUW_CWAI").as<std::string>(), "YES");
     EXPECT_TRUE(compiled.get_property("NPUW_FOLD").as<bool>());
+}
+
+TEST_F(GQACompiledModelTest, ManagedScatterWritesDirectlyToLeftAlignedStandardVLayout) {
+    auto compiled = create_managed_scatter_model(build_group_query_attention_model(/*current_seq_len=*/2,
+                                                                                   /*transpose_v=*/false),
+                                                 /*transpose_v=*/false);
+    auto request = compiled->create_infer_request();
+    ASSERT_NE(request, nullptr);
+
+    ov::Tensor past_k(ov::element::f16, ov::Shape{1, 2, 8, 16});
+    ov::Tensor past_v(ov::element::f16, ov::Shape{1, 2, 8, 16});
+    std::memset(past_k.data(), 0, past_k.get_byte_size());
+    std::memset(past_v.data(), 0, past_v.get_byte_size());
+    for (std::size_t h = 0; h < 2; ++h) {
+        auto* k_row = past_k.data<ov::float16>() + h * 8 * 16;
+        auto* v_row = past_v.data<ov::float16>() + h * 8 * 16;
+        std::fill(k_row, k_row + 2 * 16, ov::float16{9.0f});
+        std::fill(v_row, v_row + 2 * 16, ov::float16{8.0f});
+    }
+
+    const auto& inputs = request->get_inputs();
+    const auto& outputs = request->get_outputs();
+    request->set_tensor(inputs[3], ov::get_tensor_impl(past_k));
+    request->set_tensor(inputs[4], ov::get_tensor_impl(past_v));
+    request->set_tensor(inputs[5], make_i32_scalar_tensor(3));
+    request->set_tensor(outputs[1], ov::get_tensor_impl(past_k));
+    request->set_tensor(outputs[2], ov::get_tensor_impl(past_v));
+
+    request->infer();
+
+    const auto* k = past_k.data<const ov::float16>();
+    const auto* v = past_v.data<const ov::float16>();
+    for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t s = 0; s < 8; ++s) {
+            for (std::size_t d = 0; d < 16; ++d) {
+                const auto expected_k =
+                    (s < 2) ? ov::float16{9.0f} : ((s >= 2 && s < 4) ? ov::float16{1.0f} : ov::float16{0.0f});
+                const auto expected_v =
+                    (s < 2) ? ov::float16{8.0f} : ((s >= 2 && s < 4) ? ov::float16{3.0f} : ov::float16{0.0f});
+                EXPECT_EQ(k[(h * 8 + s) * 16 + d], expected_k);
+                EXPECT_EQ(v[(h * 8 + s) * 16 + d], expected_v);
+            }
+        }
+    }
+}
+
+TEST_F(GQACompiledModelTest, ManagedScatterWritesDirectlyToLeftAlignedTransposedVLayout) {
+    auto compiled = create_managed_scatter_model(build_group_query_attention_model(/*current_seq_len=*/2,
+                                                                                   /*transpose_v=*/true),
+                                                 /*transpose_v=*/true);
+    auto request = compiled->create_infer_request();
+    ASSERT_NE(request, nullptr);
+
+    ov::Tensor past_k(ov::element::f16, ov::Shape{1, 2, 8, 16});
+    ov::Tensor past_v(ov::element::f16, ov::Shape{1, 2, 16, 8});
+    std::memset(past_k.data(), 0, past_k.get_byte_size());
+    std::memset(past_v.data(), 0, past_v.get_byte_size());
+    for (std::size_t h = 0; h < 2; ++h) {
+        auto* k_row = past_k.data<ov::float16>() + h * 8 * 16;
+        std::fill(k_row, k_row + 2 * 16, ov::float16{9.0f});
+    }
+    for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t d = 0; d < 16; ++d) {
+            auto* row = past_v.data<ov::float16>() + (h * 16 + d) * 8;
+            row[0] = ov::float16{8.0f};
+            row[1] = ov::float16{8.0f};
+        }
+    }
+
+    const auto& inputs = request->get_inputs();
+    const auto& outputs = request->get_outputs();
+    request->set_tensor(inputs[3], ov::get_tensor_impl(past_k));
+    request->set_tensor(inputs[4], ov::get_tensor_impl(past_v));
+    request->set_tensor(inputs[5], make_i32_scalar_tensor(3));
+    request->set_tensor(outputs[1], ov::get_tensor_impl(past_k));
+    request->set_tensor(outputs[2], ov::get_tensor_impl(past_v));
+
+    request->infer();
+
+    const auto* k = past_k.data<const ov::float16>();
+    const auto* v = past_v.data<const ov::float16>();
+    for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t s = 0; s < 8; ++s) {
+            for (std::size_t d = 0; d < 16; ++d) {
+                const auto expected_k =
+                    (s < 2) ? ov::float16{9.0f} : ((s >= 2 && s < 4) ? ov::float16{1.0f} : ov::float16{0.0f});
+                EXPECT_EQ(k[(h * 8 + s) * 16 + d], expected_k);
+                const auto expected_v =
+                    (s < 2) ? ov::float16{8.0f} : ((s >= 2 && s < 4) ? ov::float16{2.0f} : ov::float16{0.0f});
+                EXPECT_EQ(v[(h * 16 + d) * 8 + s], expected_v);
+            }
+        }
+    }
 }
 
 }  // namespace

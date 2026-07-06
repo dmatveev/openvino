@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <unordered_set>
 #include <utility>
 
 #include "intel_npu/config/npuw.hpp"
@@ -96,27 +97,59 @@ void apply_gqa_decomposition(const std::shared_ptr<ov::Model>& model) {
 }
 
 struct SlicedKVInfo {
+    std::vector<size_t> input_indices;
     std::vector<size_t> output_indices;
     std::vector<size_t> max_seqs;
     std::vector<bool> transposed;
 };
+
+std::string get_output_name(const ov::Output<const ov::Node>& output) {
+    const auto& names = output.get_tensor().get_names();
+    if (!names.empty()) {
+        return *names.begin();
+    }
+    return output.get_node()->get_friendly_name();
+}
+
+std::string make_past_name(const std::string& present_name) {
+    constexpr const char* kPresentKeys = "present_keys_";
+    constexpr const char* kPresentValues = "present_values_";
+    if (present_name.rfind(kPresentKeys, 0) == 0) {
+        return std::string("past_keys_") + present_name.substr(std::strlen(kPresentKeys));
+    }
+    if (present_name.rfind(kPresentValues, 0) == 0) {
+        return std::string("past_values_") + present_name.substr(std::strlen(kPresentValues));
+    }
+    return {};
+}
+
+bool has_transposed_v_layout(const ov::PartialShape& result_shape, const ov::PartialShape& cache_shape) {
+    if (result_shape.rank().is_dynamic() || cache_shape.rank().is_dynamic()) {
+        return false;
+    }
+    if (result_shape.rank().get_length() != 4 || cache_shape.rank().get_length() != 4) {
+        return false;
+    }
+
+    return result_shape[2].compatible(cache_shape[3]) && result_shape[3].compatible(cache_shape[2]) &&
+           (!result_shape[2].compatible(cache_shape[2]) || !result_shape[3].compatible(cache_shape[3]));
+}
 
 SlicedKVInfo redirect_sliced_kv_results(const std::shared_ptr<ov::Model>& inner_model,
                                         const std::shared_ptr<ov::Model>& outer_model) {
     SlicedKVInfo info;
 
     const auto& results = inner_model->get_results();
+    const auto& outer_results = outer_model->get_results();
+    const auto& outer_inputs = outer_model->inputs();
+    std::unordered_set<size_t> used_input_indices;
     for (size_t i = 0; i < results.size(); ++i) {
         auto direct_src = results[i]->input_value(0).get_node_shared_ptr();
         auto scatter = ov::as_type_ptr<ov::op::v3::ScatterUpdate>(direct_src);
-        bool transposed = false;
+        auto trans = ov::as_type_ptr<ov::op::v1::Transpose>(direct_src);
         if (!scatter) {
-            auto trans = ov::as_type_ptr<ov::op::v1::Transpose>(direct_src);
             if (trans) {
                 scatter = ov::as_type_ptr<ov::op::v3::ScatterUpdate>(trans->input_value(0).get_node_shared_ptr());
-                if (scatter) {
-                    transposed = true;
-                }
             }
         }
 
@@ -124,13 +157,62 @@ SlicedKVInfo redirect_sliced_kv_results(const std::shared_ptr<ov::Model>& inner_
             continue;
         }
 
-        if (transposed) {
-            auto trans = ov::as_type_ptr<ov::op::v1::Transpose>(direct_src);
+        const bool transposed = has_transposed_v_layout(outer_results[i]->input_value(0).get_partial_shape(),
+                                                        scatter->input_value(0).get_partial_shape());
+
+        if (transposed && trans) {
             trans->input(0).replace_source_output(scatter->input_value(2));
         } else {
             results[i]->input(0).replace_source_output(scatter->input_value(2));
         }
 
+        size_t input_idx = SIZE_MAX;
+        const auto past_name = make_past_name(get_output_name(outer_results[i]->input_value(0)));
+        if (!past_name.empty()) {
+            for (size_t j = 0; j < outer_inputs.size(); ++j) {
+                if (get_output_name(outer_inputs[j]) == past_name) {
+                    input_idx = j;
+                    break;
+                }
+            }
+        }
+        if (input_idx == SIZE_MAX) {
+            const auto& past_ps = scatter->input_value(0).get_partial_shape();
+            const auto past_et = scatter->input_value(0).get_element_type();
+            for (size_t j = 0; j < outer_inputs.size(); ++j) {
+                if (used_input_indices.count(j) != 0u) {
+                    continue;
+                }
+                if (outer_inputs[j].get_element_type() != past_et) {
+                    continue;
+                }
+                if (outer_inputs[j].get_partial_shape().compatible(past_ps)) {
+                    input_idx = j;
+                    break;
+                }
+            }
+        }
+        if (input_idx == SIZE_MAX && transposed) {
+            const auto& host_ps = outer_results[i]->input_value(0).get_partial_shape();
+            const auto host_et = outer_results[i]->input_value(0).get_element_type();
+            for (size_t j = 0; j < outer_inputs.size(); ++j) {
+                if (used_input_indices.count(j) != 0u) {
+                    continue;
+                }
+                if (outer_inputs[j].get_element_type() != host_et) {
+                    continue;
+                }
+                if (outer_inputs[j].get_partial_shape().compatible(host_ps)) {
+                    input_idx = j;
+                    break;
+                }
+            }
+        }
+        OPENVINO_ASSERT(input_idx != SIZE_MAX,
+                        "Unable to find matching past KV input for output ",
+                        get_output_name(outer_results[i]->input_value(0)));
+        used_input_indices.insert(input_idx);
+        info.input_indices.push_back(input_idx);
         info.output_indices.push_back(i);
         info.transposed.push_back(transposed);
     }
@@ -139,7 +221,6 @@ SlicedKVInfo redirect_sliced_kv_results(const std::shared_ptr<ov::Model>& inner_
         inner_model->validate_nodes_and_infer_types();
     }
 
-    const auto& outer_results = outer_model->get_results();
     for (size_t i = 0; i < info.output_indices.size(); ++i) {
         const auto& ps = outer_results[info.output_indices[i]]->input_value(0).get_partial_shape();
         const size_t seq_dim = info.transposed[i] ? 3 : 2;
@@ -306,7 +387,7 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
                 if (et == ov::element::i32 || et == ov::element::i64)
                     LOG_INFO("  " << p->get_friendly_name() << " " << et << " " << p->get_partial_shape());
             }
-            return {model, nullptr, std::move(prepared_properties), false, {}, {}, {}};
+            return {model, nullptr, std::move(prepared_properties), false, {}, {}, {}, {}};
         }
         LOG_INFO("NPUW_GQA_MANAGED: detected seqlens_k parameter '" << seqlens_k_name << "'");
 
@@ -328,11 +409,12 @@ ov::npuw::GQACompiledModel::PreparedState ov::npuw::GQACompiledModel::prepare(co
                 std::move(prepared_properties),
                 can_slice,
                 std::move(seqlens_k_name),
+                std::move(sliced_kv.input_indices),
                 std::move(sliced_kv.output_indices),
                 std::move(sliced_kv.max_seqs),
                 std::move(sliced_kv.transposed)};
     }
-    return {model, nullptr, std::move(prepared_properties), false, {}, {}, {}};
+    return {model, nullptr, std::move(prepared_properties), false, {}, {}, {}, {}};
 }
 
 std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::GQACompiledModel::make_compiled_model(
@@ -356,6 +438,7 @@ ov::npuw::GQACompiledModel::GQACompiledModel(PreparedState prepared,
           factory(prepared.inner_model ? prepared.inner_model : prepared.model, plugin, prepared.properties)),
       m_sliced(prepared.sliced),
       m_seqlens_k_name(std::move(prepared.seqlens_k_name)),
+      m_sliced_input_indices(std::move(prepared.sliced_input_indices)),
       m_sliced_output_indices(std::move(prepared.sliced_output_indices)),
       m_sliced_max_seqs(std::move(prepared.sliced_max_seqs)),
       m_sliced_transposed(std::move(prepared.sliced_transposed)) {
@@ -477,6 +560,27 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::GQACompiledModel::import_mod
 
     // Build a stub outer model that exposes the user-facing shapes (KV outputs with max_seq).
     auto outer_model = build_stub_outer_model(inner_cm, kv_indices, kv_max_seqs, kv_transposed);
+    std::vector<size_t> kv_input_indices;
+    kv_input_indices.reserve(kv_indices.size());
+    const auto& outer_inputs = outer_model->inputs();
+    const auto& outer_outputs = outer_model->outputs();
+    for (const auto output_idx : kv_indices) {
+        const auto past_name = make_past_name(get_output_name(outer_outputs[output_idx]));
+        OPENVINO_ASSERT(!past_name.empty(),
+                        "Unable to derive past KV input name from output ",
+                        get_output_name(outer_outputs[output_idx]));
+        size_t input_idx = SIZE_MAX;
+        for (size_t j = 0; j < outer_inputs.size(); ++j) {
+            if (get_output_name(outer_inputs[j]) == past_name) {
+                input_idx = j;
+                break;
+            }
+        }
+        OPENVINO_ASSERT(input_idx != SIZE_MAX,
+                        "Unable to find matching past KV input for output ",
+                        get_output_name(outer_outputs[output_idx]));
+        kv_input_indices.push_back(input_idx);
+    }
 
     // The factory ignores its model argument and returns the already-loaded inner compiled model.
     CompiledModelFactory factory = [inner_cm](const std::shared_ptr<ov::Model>&,
@@ -491,6 +595,7 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::GQACompiledModel::import_mod
     ps.properties = properties;
     ps.sliced = true;
     ps.seqlens_k_name = std::move(seqlens_k_name);
+    ps.sliced_input_indices = std::move(kv_input_indices);
     ps.sliced_output_indices = std::move(kv_indices);
     ps.sliced_max_seqs = std::move(kv_max_seqs);
     ps.sliced_transposed = std::move(kv_transposed);
@@ -592,6 +697,11 @@ bool ov::npuw::ManagedGQAInferRequest::is_kv_output_locked(size_t idx) const {
     return std::find(kv.begin(), kv.end(), idx) != kv.end();
 }
 
+bool ov::npuw::ManagedGQAInferRequest::is_kv_input_locked(size_t idx) const {
+    const auto& kv = m_compiled_model->m_sliced_input_indices;
+    return std::find(kv.begin(), kv.end(), idx) != kv.end();
+}
+
 int64_t ov::npuw::ManagedGQAInferRequest::read_seqlens_k_locked() const {
     const auto& inner_inputs = m_inner_request->get_compiled_model()->inputs();
     size_t sk_idx = SIZE_MAX;
@@ -609,6 +719,66 @@ int64_t ov::npuw::ManagedGQAInferRequest::read_seqlens_k_locked() const {
     if (sk->get_element_type() == ov::element::i32)
         return static_cast<int64_t>(*reinterpret_cast<const int32_t*>(sk->data()));
     return *reinterpret_cast<const int64_t*>(sk->data());
+}
+
+void ov::npuw::ManagedGQAInferRequest::prepare_kv_inputs_locked(int64_t seqlens_k_val) const {
+    for (size_t ki = 0; ki < m_compiled_model->m_sliced_input_indices.size(); ++ki) {
+        const size_t input_idx = m_compiled_model->m_sliced_input_indices[ki];
+        auto user_it = m_user_kv_input_tensors.find(input_idx);
+        auto work_it = m_kv_input_working_tensors.find(input_idx);
+        if (user_it == m_user_kv_input_tensors.end() || work_it == m_kv_input_working_tensors.end()) {
+            continue;
+        }
+
+        const auto& user_t = user_it->second;
+        const auto& work_t = work_it->second;
+        const bool transposed =
+            (ki < m_compiled_model->m_sliced_transposed.size()) && m_compiled_model->m_sliced_transposed[ki];
+        const auto work_shape = work_t->get_shape();
+        const auto& inner_outputs = m_inner_request->get_compiled_model()->outputs();
+        const auto output_shape = inner_outputs.at(m_compiled_model->m_sliced_output_indices[ki]).get_shape();
+        const size_t curr_seq = transposed ? output_shape[3] : output_shape[2];
+        const size_t max_seq = transposed ? work_shape[3] : work_shape[2];
+        OPENVINO_ASSERT(seqlens_k_val + 1 >= static_cast<int64_t>(curr_seq),
+                        "Invalid managed KV input lengths: seqlens_k=",
+                        seqlens_k_val,
+                        " curr_seq=",
+                        curr_seq,
+                        " on input ",
+                        input_idx);
+        const size_t past_seq = static_cast<size_t>(seqlens_k_val + 1 - static_cast<int64_t>(curr_seq));
+        OPENVINO_ASSERT(past_seq <= max_seq,
+                        "Invalid past_seq=",
+                        past_seq,
+                        " for max_seq=",
+                        max_seq,
+                        " on input ",
+                        input_idx);
+
+        std::memset(work_t->data(), 0, work_t->get_byte_size());
+        const size_t kv_heads = work_shape[1];
+        const size_t esz = work_t->get_element_type().size();
+        const char* src = reinterpret_cast<const char*>(user_t->data());
+        char* dst = reinterpret_cast<char*>(work_t->data());
+        if (!transposed) {
+            const size_t head_size = work_shape[3];
+            for (size_t h = 0; h < kv_heads; ++h) {
+                std::memcpy(dst + h * max_seq * head_size * esz,
+                            src + h * max_seq * head_size * esz,
+                            past_seq * head_size * esz);
+            }
+            continue;
+        }
+
+        const size_t head_size = work_shape[2];
+        for (size_t h = 0; h < kv_heads; ++h) {
+            for (size_t d = 0; d < head_size; ++d) {
+                std::memcpy(dst + (h * head_size + d) * max_seq * esz,
+                            src + (h * head_size + d) * max_seq * esz,
+                            past_seq * esz);
+            }
+        }
+    }
 }
 
 void ov::npuw::ManagedGQAInferRequest::scatter_kv_outputs_locked(int64_t seqlens_k_val) const {
@@ -635,19 +805,28 @@ void ov::npuw::ManagedGQAInferRequest::scatter_kv_outputs_locked(int64_t seqlens
         const bool transposed =
             (ki < m_compiled_model->m_sliced_transposed.size()) && m_compiled_model->m_sliced_transposed[ki];
         const size_t curr_seq = transposed ? inner_shape[3] : inner_shape[2];
-        OPENVINO_ASSERT(seqlens_k_val >= static_cast<int64_t>(curr_seq) - 1,
-                        "Invalid seqlens_k=",
-                        seqlens_k_val,
-                        " for curr_seq=",
-                        curr_seq,
-                        " on KV output ",
-                        kv_idx);
-        const size_t past = static_cast<size_t>(seqlens_k_val - static_cast<int64_t>(curr_seq) + 1);
         if (!transposed) {
             const size_t head_size = inner_shape[3];
             const size_t max_seq = user_t->get_shape()[2];
+            OPENVINO_ASSERT(seqlens_k_val >= 0 && seqlens_k_val < static_cast<int64_t>(max_seq),
+                            "Invalid seqlens_k=",
+                            seqlens_k_val,
+                            " for max_seq=",
+                            max_seq,
+                            " on KV output ",
+                            kv_idx);
+            const size_t total_seq = static_cast<size_t>(seqlens_k_val) + 1;
+            OPENVINO_ASSERT(curr_seq <= total_seq,
+                            "Invalid managed K sequence lengths: curr_seq=",
+                            curr_seq,
+                            " total_seq=",
+                            total_seq,
+                            " on KV output ",
+                            kv_idx);
+            const size_t insert_at = total_seq - curr_seq;
             for (size_t h = 0; h < kv_heads; ++h) {
-                std::memcpy(dst + (h * max_seq + past) * head_size * esz,
+                char* head_dst = dst + h * max_seq * head_size * esz;
+                std::memcpy(head_dst + insert_at * head_size * esz,
                             src + h * curr_seq * head_size * esz,
                             curr_seq * head_size * esz);
             }
@@ -656,11 +835,26 @@ void ov::npuw::ManagedGQAInferRequest::scatter_kv_outputs_locked(int64_t seqlens
 
         const size_t head_size = inner_shape[2];
         const size_t max_seq = user_t->get_shape()[3];
+        OPENVINO_ASSERT(seqlens_k_val >= 0 && seqlens_k_val < static_cast<int64_t>(max_seq),
+                        "Invalid seqlens_k=",
+                        seqlens_k_val,
+                        " for max_seq=",
+                        max_seq,
+                        " on KV output ",
+                        kv_idx);
+        const size_t total_seq = static_cast<size_t>(seqlens_k_val) + 1;
+        OPENVINO_ASSERT(curr_seq <= total_seq,
+                        "Invalid managed V sequence lengths: curr_seq=",
+                        curr_seq,
+                        " total_seq=",
+                        total_seq,
+                        " on KV output ",
+                        kv_idx);
+        const size_t insert_at = total_seq - curr_seq;
         for (size_t h = 0; h < kv_heads; ++h) {
             for (size_t d = 0; d < head_size; ++d) {
-                std::memcpy(dst + ((h * head_size + d) * max_seq + past) * esz,
-                            src + (h * head_size + d) * curr_seq * esz,
-                            curr_seq * esz);
+                char* row_dst = dst + (h * head_size + d) * max_seq * esz;
+                std::memcpy(row_dst + insert_at * esz, src + (h * head_size + d) * curr_seq * esz, curr_seq * esz);
             }
         }
     }
@@ -671,6 +865,7 @@ void ov::npuw::ManagedGQAInferRequest::infer() {
     ensure_inner_request_locked();
 
     const int64_t seqlens_k_val = read_seqlens_k_locked();
+    prepare_kv_inputs_locked(seqlens_k_val);
     m_inner_request->infer();
     scatter_kv_outputs_locked(seqlens_k_val);
 }
@@ -712,6 +907,24 @@ void ov::npuw::ManagedGQAInferRequest::set_tensor(const ov::Output<const ov::Nod
                     wt = ov::make_tensor(inner_port.get_element_type(), needed_shape);
                 }
                 m_inner_request->set_tensor(inner_outputs[i], wt);
+            }
+            return;
+        }
+    }
+
+    const auto& outer_inputs = m_compiled_model->inputs();
+    const auto& inner_inputs = m_inner_request->get_compiled_model()->inputs();
+    for (size_t i = 0; i < outer_inputs.size(); ++i) {
+        if (outer_inputs[i] == port && is_kv_input_locked(i)) {
+            m_user_kv_input_tensors[i] = tensor;
+            if (i < inner_inputs.size()) {
+                auto& wt = m_kv_input_working_tensors[i];
+                const auto& inner_port = inner_inputs[i];
+                const auto needed_shape = inner_port.get_partial_shape().to_shape();
+                if (!wt || wt->get_shape() != needed_shape) {
+                    wt = ov::make_tensor(inner_port.get_element_type(), needed_shape);
+                }
+                m_inner_request->set_tensor(inner_inputs[i], wt);
             }
             return;
         }
